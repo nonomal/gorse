@@ -17,9 +17,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+
 	"github.com/benhoyt/goawk/interp"
 	"github.com/benhoyt/goawk/parser"
 	"github.com/juju/errors"
@@ -33,17 +40,12 @@ import (
 	"github.com/zhenghaoz/gorse/storage/data"
 	"github.com/zhenghaoz/gorse/worker"
 	"go.uber.org/zap"
-	"io"
-	"net/http"
-	"os"
-	"os/signal"
-	"strings"
 )
 
 //go:embed mysql2sqlite
 var mysql2SQLite string
 
-const playgroundDataFile = "https://cdn.gorse.io/example/github.sql"
+const playgroundDataFile = "https://cdn.gorse.io/example/github.sql.gz"
 
 var oneCommand = &cobra.Command{
 	Use:   "gorse-in-one",
@@ -56,17 +58,8 @@ var oneCommand = &cobra.Command{
 		}
 
 		// setup logger
-		var outputPaths []string
-		if cmd.PersistentFlags().Changed("log-path") {
-			outputPath, _ := cmd.PersistentFlags().GetString("log-path")
-			outputPaths = append(outputPaths, outputPath)
-		}
-		debugMode, _ := cmd.PersistentFlags().GetBool("debug")
-		if debugMode {
-			log.SetDevelopmentLogger(outputPaths...)
-		} else {
-			log.SetProductionLogger(outputPaths...)
-		}
+		debug, _ := cmd.PersistentFlags().GetBool("debug")
+		log.SetLogger(cmd.PersistentFlags(), debug)
 
 		// load config
 		var conf *config.Config
@@ -90,9 +83,9 @@ var oneCommand = &cobra.Command{
 			}
 
 			fmt.Println()
-			fmt.Printf("    Dashboard:     http://%s:%d/overview\n", conf.Master.HttpHost, conf.Master.HttpPort)
-			fmt.Printf("    RESTful APIs:  http://%s:%d/apidocs\n", conf.Master.HttpHost, conf.Master.HttpPort)
-			fmt.Printf("    Documentation: https://docs.gorse.io/\n")
+			fmt.Printf("    Dashboard:     http://127.0.0.1:%d/overview\n", conf.Master.HttpPort)
+			fmt.Printf("    RESTful APIs:  http://127.0.0.1:%d/apidocs\n", conf.Master.HttpPort)
+			fmt.Printf("    Documentation: https://gorse.io/docs\n")
 			fmt.Println()
 		} else {
 			configPath, _ := cmd.PersistentFlags().GetString("config")
@@ -105,12 +98,13 @@ var oneCommand = &cobra.Command{
 
 		// create master
 		cachePath, _ := cmd.PersistentFlags().GetString("cache-path")
-		m := master.NewMaster(conf, cachePath)
+		managedMode, _ := cmd.PersistentFlags().GetBool("managed")
+		m := master.NewMaster(conf, cachePath, managedMode)
 		// Start worker
+		workerJobs, _ := cmd.PersistentFlags().GetInt("recommend-jobs")
+		w := worker.NewWorker(conf.Master.Host, conf.Master.Port, conf.Master.Host,
+			0, workerJobs, "", managedMode, nil)
 		go func() {
-			workerJobs, _ := cmd.PersistentFlags().GetInt("recommend-jobs")
-			w := worker.NewWorker(conf.Master.Host, conf.Master.Port, conf.Master.Host,
-				0, workerJobs, "")
 			w.SetOneMode(m.Settings)
 			w.Serve()
 		}()
@@ -124,6 +118,7 @@ var oneCommand = &cobra.Command{
 			close(done)
 		}()
 		// Start master
+		m.SetOneMode(w.ScheduleAPIHandler)
 		m.Serve()
 		<-done
 		log.Logger().Info("stop gorse-in-one successfully")
@@ -131,9 +126,10 @@ var oneCommand = &cobra.Command{
 }
 
 func init() {
+	log.AddFlags(oneCommand.PersistentFlags())
 	oneCommand.PersistentFlags().Bool("debug", false, "use debug log mode")
+	oneCommand.PersistentFlags().Bool("managed", false, "enable managed mode")
 	oneCommand.PersistentFlags().BoolP("version", "v", false, "gorse version")
-	oneCommand.PersistentFlags().String("log-path", "", "path of log file")
 	oneCommand.PersistentFlags().Bool("playground", false, "playground mode (setup a recommender system for GitHub repositories)")
 	oneCommand.PersistentFlags().StringP("config", "c", "", "configuration file path")
 	oneCommand.PersistentFlags().String("cache-path", "one_cache.data", "path of cache file")
@@ -184,15 +180,18 @@ func initializeDatabase(path string) error {
 	}
 
 	// load mysqldump file
-	bar := progressbar.DefaultBytes(
+	pbReader := progressbar.NewReader(resp.Body, progressbar.DefaultBytes(
 		resp.ContentLength,
 		"Downloading playground dataset",
-	)
-	reader := bufio.NewReader(resp.Body)
+	))
+	gzipReader, err := gzip.NewReader(&pbReader)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	reader := bufio.NewReader(gzipReader)
 	var builder strings.Builder
 	for {
 		line, isPrefix, err := reader.ReadLine()
-		_ = bar.Add(len(line))
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -200,7 +199,6 @@ func initializeDatabase(path string) error {
 		}
 		builder.Write(line)
 		if !isPrefix {
-			_ = bar.Add(1)
 			text := builder.String()
 			if strings.HasPrefix(text, "INSERT INTO ") {
 				// convert to SQLite sql

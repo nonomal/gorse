@@ -11,16 +11,51 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 syntax = "proto3";
 
 option go_package = "github.com/zhenghaoz/gorse/protocol";
 
 package protocol;
 
+import "google/protobuf/timestamp.proto";
+
+message Tensor {
+  repeated string key = 1;
+  repeated int32 shape = 2;
+  repeated float data = 3;
+}
+
+message User {
+  string user_id = 1;
+  bytes labels = 2;
+  string comment = 3;
+  repeated string subscribe = 4;
+}
+
+message Item {
+  string namespace = 1;
+  string item_id = 2;
+  bool is_hidden = 3;
+  repeated string categories = 4;
+  google.protobuf.Timestamp timestamp = 5;
+  bytes labels = 6;
+  string comment = 7;
+}
+
+message Feedback {
+  string namespace = 1;
+  string feedback_type = 2;
+  string user_id = 3;
+  string item_id = 4;
+  google.protobuf.Timestamp timestamp = 5;
+  string comment = 6;
+}
+
 enum NodeType {
-  ServerNode = 0;
-  WorkerNode = 1;
-  ClientNode = 2;
+  Server = 0;
+  Worker = 1;
+  Client = 2;
 }
 
 service Master {
@@ -32,9 +67,7 @@ service Master {
   rpc GetRankingModel(VersionInfo) returns (stream Fragment) {}
   rpc GetClickModel(VersionInfo) returns (stream Fragment) {}
 
-  /* task management */
-  rpc PushTaskInfo(PushTaskInfoRequest) returns (PushTaskInfoResponse) {}
-
+  rpc PushProgress(PushProgressRequest) returns (PushProgressResponse) {}
 }
 
 message Meta {
@@ -56,19 +89,58 @@ message VersionInfo {
 
 message NodeInfo {
   NodeType node_type = 1;
-  string node_name = 2;
-  int64 http_port = 3;
+  string uuid = 2;
   string binary_version = 4;
+  string hostname = 5;
 }
 
-message PushTaskInfoRequest {
+message Progress {
+  string tracer = 1;
+  string name = 2;
+  string status = 3;
+  string error = 4;
+  int64 count = 5;
+  int64 total = 6;
+  int64 start_time = 7;
+  int64 finish_time = 8;
+}
+
+message PushProgressRequest {
+  repeated Progress progress = 1;
+}
+
+message PushProgressResponse {}
+
+message PingRequest {}
+
+message PingResponse {}
+
+message UploadBlobRequest {
   string name = 1;
-  string status = 2;
-  int64 done = 3;
-  int64 total = 4;
-  int64 start_time = 5;
-  int64 finish_time = 6;
-  string error = 7;
+  google.protobuf.Timestamp timestamp = 2;
+  bytes data = 3;
 }
 
-message PushTaskInfoResponse {}
+message UploadBlobResponse {}
+
+message FetchBlobRequest {
+  string name = 1;
+}
+
+message FetchBlobResponse {
+  google.protobuf.Timestamp timestamp = 1;
+}
+
+message DownloadBlobRequest {
+  string name = 1;
+}
+
+message DownloadBlobResponse {
+  bytes data = 1;
+}
+
+service BlobStore {
+  rpc UploadBlob(stream UploadBlobRequest) returns (UploadBlobResponse) {}
+  rpc FetchBlob(FetchBlobRequest) returns (FetchBlobResponse) {}
+  rpc DownloadBlob(DownloadBlobRequest) returns (stream DownloadBlobResponse) {}
+}

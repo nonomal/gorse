@@ -16,6 +16,9 @@ package storage
 
 import (
 	"database/sql"
+	"net/url"
+	"strings"
+
 	"github.com/go-sql-driver/mysql"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
@@ -23,23 +26,22 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/schema"
 	"moul.io/zapgorm2"
-	"net/url"
-	"strings"
 )
 
 const (
-	MySQLPrefix      = "mysql://"
-	MongoPrefix      = "mongodb://"
-	MongoSrvPrefix   = "mongodb+srv://"
-	PostgresPrefix   = "postgres://"
-	PostgreSQLPrefix = "postgresql://"
-	ClickhousePrefix = "clickhouse://"
-	CHHTTPPrefix     = "chhttp://"
-	CHHTTPSPrefix    = "chhttps://"
-	SQLitePrefix     = "sqlite://"
-	RedisPrefix      = "redis://"
-	RedissPrefix     = "rediss://"
-	OraclePrefix     = "oracle://"
+	MySQLPrefix         = "mysql://"
+	MongoPrefix         = "mongodb://"
+	MongoSrvPrefix      = "mongodb+srv://"
+	PostgresPrefix      = "postgres://"
+	PostgreSQLPrefix    = "postgresql://"
+	ClickhousePrefix    = "clickhouse://"
+	CHHTTPPrefix        = "chhttp://"
+	CHHTTPSPrefix       = "chhttps://"
+	SQLitePrefix        = "sqlite://"
+	RedisPrefix         = "redis://"
+	RedissPrefix        = "rediss://"
+	RedisClusterPrefix  = "redis+cluster://"
+	RedissClusterPrefix = "rediss+cluster://"
 )
 
 func AppendURLParams(rawURL string, params []lo.Tuple2[string, string]) (string, error) {
@@ -77,7 +79,7 @@ func ProbeMySQLIsolationVariableName(dsn string) (string, error) {
 		return "", errors.Trace(err)
 	}
 	defer connection.Close()
-	rows, err := connection.Query("SHOW VARIABLES LIKE '%isolation%'")
+	rows, err := connection.Query("SHOW VARIABLES WHERE variable_name = 'transaction_isolation' OR variable_name = 'tx_isolation'")
 	if err != nil {
 		return "", errors.Trace(err)
 	}
@@ -101,8 +103,16 @@ func (tp TablePrefix) SetsTable() string {
 	return string(tp) + "sets"
 }
 
-func (tp TablePrefix) SortedSetsTable() string {
-	return string(tp) + "sorted_sets"
+func (tp TablePrefix) MessageTable() string {
+	return string(tp) + "message"
+}
+
+func (tp TablePrefix) DocumentTable() string {
+	return string(tp) + "documents"
+}
+
+func (tp TablePrefix) PointsTable() string {
+	return string(tp) + "time_series_points"
 }
 
 func (tp TablePrefix) UsersTable() string {
@@ -115,6 +125,16 @@ func (tp TablePrefix) ItemsTable() string {
 
 func (tp TablePrefix) FeedbackTable() string {
 	return string(tp) + "feedback"
+}
+
+// UserFeedbackTable returns the materialized view of user feedback.
+func (tp TablePrefix) UserFeedbackTable() string {
+	return string(tp) + "user_feedback"
+}
+
+// ItemFeedbackTable returns the materialized view of item feedback.
+func (tp TablePrefix) ItemFeedbackTable() string {
+	return string(tp) + "item_feedback"
 }
 
 func (tp TablePrefix) Key(key string) string {
@@ -132,10 +152,12 @@ func NewGORMConfig(tablePrefix string) *gorm.Config {
 			NameReplacer: strings.NewReplacer(
 				"SQLValue", "Values",
 				"SQLSet", "Sets",
-				"SQLSortedSet", "SortedSets",
 				"SQLUser", "Users",
 				"SQLItem", "Items",
 				"SQLFeedback", "Feedback",
+				"SQLDocument", "Documents",
+				"PostgresDocument", "Documents",
+				"TimeSeriesPoint", "time_series_points",
 				"ClickhouseUser", "Users",
 				"ClickHouseItem", "Items",
 				"ClickHouseFeedback", "Feedback",

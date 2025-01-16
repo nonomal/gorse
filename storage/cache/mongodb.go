@@ -16,6 +16,9 @@ package cache
 
 import (
 	"context"
+	"io"
+	"time"
+
 	"github.com/juju/errors"
 	"github.com/zhenghaoz/gorse/storage"
 	"go.mongodb.org/mongo-driver/bson"
@@ -33,7 +36,7 @@ func (m MongoDB) Init() error {
 	ctx := context.Background()
 	d := m.client.Database(m.dbName)
 	// list collections
-	var hasValues, hasSets, hasSortedSets bool
+	var hasValues, hasSets bool
 	collections, err := d.ListCollectionNames(ctx, bson.M{})
 	if err != nil {
 		return errors.Trace(err)
@@ -44,8 +47,6 @@ func (m MongoDB) Init() error {
 			hasValues = true
 		case m.SetsTable():
 			hasSets = true
-		case m.SortedSetsTable():
-			hasSortedSets = true
 		}
 	}
 	// create collections
@@ -56,11 +57,6 @@ func (m MongoDB) Init() error {
 	}
 	if !hasSets {
 		if err = d.CreateCollection(ctx, m.SetsTable()); err != nil {
-			return errors.Trace(err)
-		}
-	}
-	if !hasSortedSets {
-		if err = d.CreateCollection(ctx, m.SortedSetsTable()); err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -75,20 +71,53 @@ func (m MongoDB) Init() error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	_, err = d.Collection(m.SortedSetsTable()).Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{"name", 1},
-			{"member", 1},
+	_, err = d.Collection(m.MessageTable()).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			// update set ... where name = ? and value = ?
+			Keys: bson.D{
+				{"name", 1},
+				{"value", 1},
+			},
 		},
-		Options: options.Index().SetUnique(true),
+		{
+			// select * from messages where name = ? order by timestamp asc limit 1
+			Keys: bson.D{
+				{"name", 1},
+				{"timestamp", 1},
+			},
+		},
 	})
 	if err != nil {
 		return errors.Trace(err)
 	}
-	_, err = d.Collection(m.SortedSetsTable()).Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{"name", 1},
-			{"score", 1},
+	_, err = d.Collection(m.DocumentTable()).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys: bson.D{
+				{"collection", 1},
+				{"subset", 1},
+				{"id", 1},
+			},
+		},
+		{
+			Keys: bson.D{
+				{"collection", 1},
+				{"subset", 1},
+				{"categories", 1},
+				{"is_hidden", 1},
+				{"score", -1},
+			},
+		},
+	})
+	if err != nil {
+		return errors.Trace(err)
+	}
+	_, err = d.Collection(m.PointsTable()).Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			// update set ... where name = ? and timestammp = ?
+			Keys: bson.D{
+				{"name", 1},
+				{"timestamp", 1},
+			},
 		},
 	})
 	if err != nil {
@@ -99,6 +128,10 @@ func (m MongoDB) Init() error {
 
 func (m MongoDB) Close() error {
 	return m.client.Disconnect(context.Background())
+}
+
+func (m MongoDB) Ping() error {
+	return m.client.Ping(context.Background(), nil)
 }
 
 func (m MongoDB) Scan(work func(string) error) error {
@@ -142,36 +175,25 @@ func (m MongoDB) Scan(work func(string) error) error {
 			prevKey = key
 		}
 	}
+	return nil
+}
 
-	// scan sorted sets
-	sortedSetCollection := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
-	sortedSetIterator, err := sortedSetCollection.Find(ctx, bson.M{})
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer sortedSetIterator.Close(ctx)
-	prevKey = ""
-	for sortedSetIterator.Next(ctx) {
-		var row bson.Raw
-		if err = sortedSetIterator.Decode(&row); err != nil {
+func (m MongoDB) Purge() error {
+	tables := []string{m.ValuesTable(), m.SetsTable(), m.DocumentTable()}
+	for _, tableName := range tables {
+		c := m.client.Database(m.dbName).Collection(tableName)
+		_, err := c.DeleteMany(context.Background(), bson.D{})
+		if err != nil {
 			return errors.Trace(err)
-		}
-		key := row.Lookup("name").StringValue()
-		if key != prevKey {
-			if err = work(key); err != nil {
-				return errors.Trace(err)
-			}
-			prevKey = key
 		}
 	}
 	return nil
 }
 
-func (m MongoDB) Set(values ...Value) error {
+func (m MongoDB) Set(ctx context.Context, values ...Value) error {
 	if len(values) == 0 {
 		return nil
 	}
-	ctx := context.Background()
 	c := m.client.Database(m.dbName).Collection(m.ValuesTable())
 	var models []mongo.WriteModel
 	for _, value := range values {
@@ -184,8 +206,7 @@ func (m MongoDB) Set(values ...Value) error {
 	return errors.Trace(err)
 }
 
-func (m MongoDB) Get(name string) *ReturnValue {
-	ctx := context.Background()
+func (m MongoDB) Get(ctx context.Context, name string) *ReturnValue {
 	c := m.client.Database(m.dbName).Collection(m.ValuesTable())
 	r := c.FindOne(ctx, bson.M{"_id": bson.M{"$eq": name}})
 	if err := r.Err(); err == mongo.ErrNoDocuments {
@@ -200,15 +221,13 @@ func (m MongoDB) Get(name string) *ReturnValue {
 	}
 }
 
-func (m MongoDB) Delete(name string) error {
-	ctx := context.Background()
+func (m MongoDB) Delete(ctx context.Context, name string) error {
 	c := m.client.Database(m.dbName).Collection(m.ValuesTable())
 	_, err := c.DeleteOne(ctx, bson.M{"_id": bson.M{"$eq": name}})
 	return errors.Trace(err)
 }
 
-func (m MongoDB) GetSet(name string) ([]string, error) {
-	ctx := context.Background()
+func (m MongoDB) GetSet(ctx context.Context, name string) ([]string, error) {
 	c := m.client.Database(m.dbName).Collection(m.SetsTable())
 	r, err := c.Find(ctx, bson.M{"name": name})
 	if err != nil {
@@ -225,8 +244,7 @@ func (m MongoDB) GetSet(name string) ([]string, error) {
 	return members, nil
 }
 
-func (m MongoDB) SetSet(name string, members ...string) error {
-	ctx := context.Background()
+func (m MongoDB) SetSet(ctx context.Context, name string, members ...string) error {
 	c := m.client.Database(m.dbName).Collection(m.SetsTable())
 	var models []mongo.WriteModel
 	models = append(models, mongo.NewDeleteManyModel().SetFilter(bson.M{"name": bson.M{"$eq": name}}))
@@ -240,11 +258,10 @@ func (m MongoDB) SetSet(name string, members ...string) error {
 	return errors.Trace(err)
 }
 
-func (m MongoDB) AddSet(name string, members ...string) error {
+func (m MongoDB) AddSet(ctx context.Context, name string, members ...string) error {
 	if len(members) == 0 {
 		return nil
 	}
-	ctx := context.Background()
 	c := m.client.Database(m.dbName).Collection(m.SetsTable())
 	var models []mongo.WriteModel
 	for _, member := range members {
@@ -257,11 +274,10 @@ func (m MongoDB) AddSet(name string, members ...string) error {
 	return errors.Trace(err)
 }
 
-func (m MongoDB) RemSet(name string, members ...string) error {
+func (m MongoDB) RemSet(ctx context.Context, name string, members ...string) error {
 	if len(members) == 0 {
 		return nil
 	}
-	ctx := context.Background()
 	c := m.client.Database(m.dbName).Collection(m.SetsTable())
 	var models []mongo.WriteModel
 	for _, member := range members {
@@ -272,117 +288,165 @@ func (m MongoDB) RemSet(name string, members ...string) error {
 	return errors.Trace(err)
 }
 
-func (m MongoDB) GetSorted(name string, begin, end int) ([]Scored, error) {
-	ctx := context.Background()
-	c := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
-	opt := options.Find()
-	opt.SetSort(bson.M{"score": -1})
-	if end >= 0 {
-		opt.SetLimit(int64(end + 1))
-	}
-	r, err := c.Find(ctx, bson.M{"name": name}, opt)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	var scores []Scored
-	for r.Next(ctx) {
-		var doc bson.Raw
-		if err = r.Decode(&doc); err != nil {
-			return nil, errors.Trace(err)
-		}
-		scores = append(scores, Scored{
-			Id:    doc.Lookup("member").StringValue(),
-			Score: doc.Lookup("score").Double(),
-		})
-	}
-	if len(scores) >= begin {
-		scores = scores[begin:]
-	}
-	return scores, nil
+func (m MongoDB) Push(ctx context.Context, name, value string) error {
+	_, err := m.client.Database(m.dbName).Collection(m.MessageTable()).UpdateOne(ctx,
+		bson.M{"name": name, "value": value},
+		bson.M{"$set": bson.M{"name": name, "value": value, "timestamp": time.Now().UnixNano()}},
+		options.Update().SetUpsert(true))
+	return err
 }
 
-func (m MongoDB) GetSortedByScore(name string, begin, end float64) ([]Scored, error) {
-	ctx := context.Background()
-	c := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
-	opt := options.Find()
-	opt.SetSort(bson.M{"score": 1})
-	r, err := c.Find(ctx, bson.D{
-		{"name", name},
-		{"score", bson.M{"$gte": begin}},
-		{"score", bson.M{"$lte": end}},
-	}, opt)
-	if err != nil {
-		return nil, errors.Trace(err)
+func (m MongoDB) Pop(ctx context.Context, name string) (string, error) {
+	result := m.client.Database(m.dbName).Collection(m.MessageTable()).FindOneAndDelete(ctx,
+		bson.M{"name": name}, options.FindOneAndDelete().SetSort(bson.M{"timestamp": 1}))
+	if err := result.Err(); err == mongo.ErrNoDocuments {
+		return "", io.EOF
+	} else if err != nil {
+		return "", errors.Trace(err)
 	}
-	var scores []Scored
-	for r.Next(ctx) {
-		var doc bson.Raw
-		if err = r.Decode(&doc); err != nil {
-			return nil, err
-		}
-		scores = append(scores, Scored{
-			Id:    doc.Lookup("member").StringValue(),
-			Score: doc.Lookup("score").Double(),
-		})
+	var b bson.M
+	if err := result.Decode(&b); err != nil {
+		return "", errors.Trace(err)
 	}
-	return scores, nil
+	return b["value"].(string), nil
 }
 
-func (m MongoDB) RemSortedByScore(name string, begin, end float64) error {
-	ctx := context.Background()
-	c := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
-	_, err := c.DeleteMany(ctx, bson.D{
-		{"name", name},
-		{"score", bson.M{"$gte": begin}},
-		{"score", bson.M{"$lte": end}},
+func (m MongoDB) Remain(ctx context.Context, name string) (int64, error) {
+	return m.client.Database(m.dbName).Collection(m.MessageTable()).CountDocuments(ctx, bson.M{
+		"name": name,
 	})
-	return errors.Trace(err)
 }
 
-func (m MongoDB) AddSorted(sortedSets ...SortedSet) error {
-	ctx := context.Background()
-	c := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
-	var models []mongo.WriteModel
-	for _, sorted := range sortedSets {
-		for _, score := range sorted.scores {
-			models = append(models, mongo.NewUpdateOneModel().
-				SetUpsert(true).
-				SetFilter(bson.M{"name": sorted.name, "member": score.Id}).
-				SetUpdate(bson.M{"$set": bson.M{"name": sorted.name, "member": score.Id, "score": score.Score}}))
-		}
-	}
-	if len(models) == 0 {
+func (m MongoDB) AddScores(ctx context.Context, collection, subset string, documents []Score) error {
+	if len(documents) == 0 {
 		return nil
 	}
-	_, err := c.BulkWrite(ctx, models)
-	return errors.Trace(err)
-}
-
-func (m MongoDB) SetSorted(name string, scores []Scored) error {
-	ctx := context.Background()
-	c := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
 	var models []mongo.WriteModel
-	models = append(models, mongo.NewDeleteManyModel().SetFilter(bson.M{"name": bson.M{"$eq": name}}))
-	for _, score := range scores {
+	for _, document := range documents {
 		models = append(models, mongo.NewUpdateOneModel().
 			SetUpsert(true).
-			SetFilter(bson.M{"name": bson.M{"$eq": name}, "member": bson.M{"$eq": score.Id}}).
-			SetUpdate(bson.M{"$set": bson.M{"name": name, "member": score.Id, "score": score.Score}}))
+			SetFilter(bson.M{
+				"collection": collection,
+				"subset":     subset,
+				"id":         document.Id,
+			}).
+			SetUpdate(bson.M{"$set": bson.M{
+				"score":      document.Score,
+				"is_hidden":  document.IsHidden,
+				"categories": document.Categories,
+				"timestamp":  document.Timestamp,
+			}}))
 	}
-	_, err := c.BulkWrite(ctx, models)
+	_, err := m.client.Database(m.dbName).Collection(m.DocumentTable()).BulkWrite(ctx, models)
 	return errors.Trace(err)
 }
 
-func (m MongoDB) RemSorted(members ...SetMember) error {
-	if len(members) == 0 {
+func (m MongoDB) SearchScores(ctx context.Context, collection, subset string, query []string, begin, end int) ([]Score, error) {
+	opt := options.Find().SetSkip(int64(begin)).SetSort(bson.M{"score": -1})
+	if end != -1 {
+		opt.SetLimit(int64(end - begin))
+	}
+	filter := bson.M{
+		"collection": collection,
+		"subset":     subset,
+		"is_hidden":  false,
+	}
+	if len(query) > 0 {
+		filter["categories"] = bson.M{"$all": query}
+	}
+	cur, err := m.client.Database(m.dbName).Collection(m.DocumentTable()).Find(ctx, filter, opt)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	documents := make([]Score, 0)
+	for cur.Next(ctx) {
+		var document Score
+		if err = cur.Decode(&document); err != nil {
+			return nil, errors.Trace(err)
+		}
+		documents = append(documents, document)
+	}
+	return documents, nil
+}
+
+func (m MongoDB) UpdateScores(ctx context.Context, collections []string, subset *string, id string, patch ScorePatch) error {
+	if len(collections) == 0 {
 		return nil
 	}
-	ctx := context.Background()
-	c := m.client.Database(m.dbName).Collection(m.SortedSetsTable())
-	var models []mongo.WriteModel
-	for _, member := range members {
-		models = append(models, mongo.NewDeleteOneModel().SetFilter(bson.M{"name": member.name, "member": member.member}))
+	if patch.IsHidden == nil && patch.Categories == nil && patch.Score == nil {
+		return nil
 	}
-	_, err := c.BulkWrite(ctx, models)
+	filter := bson.M{
+		"collection": bson.M{"$in": collections},
+		"id":         id,
+	}
+	if subset != nil {
+		filter["subset"] = *subset
+	}
+	update := bson.D{}
+	if patch.IsHidden != nil {
+		update = append(update, bson.E{Key: "$set", Value: bson.M{"is_hidden": *patch.IsHidden}})
+	}
+	if patch.Categories != nil {
+		update = append(update, bson.E{Key: "$set", Value: bson.M{"categories": patch.Categories}})
+	}
+	if patch.Score != nil {
+		update = append(update, bson.E{Key: "$set", Value: bson.M{"score": *patch.Score}})
+	}
+	_, err := m.client.Database(m.dbName).Collection(m.DocumentTable()).UpdateMany(ctx, filter, update)
 	return errors.Trace(err)
+}
+
+func (m MongoDB) DeleteScores(ctx context.Context, collections []string, condition ScoreCondition) error {
+	if err := condition.Check(); err != nil {
+		return errors.Trace(err)
+	}
+	filter := bson.M{"collection": bson.M{"$in": collections}}
+	if condition.Subset != nil {
+		filter["subset"] = condition.Subset
+	}
+	if condition.Id != nil {
+		filter["id"] = condition.Id
+	}
+	if condition.Before != nil {
+		filter["timestamp"] = bson.M{"$lt": condition.Before}
+	}
+	_, err := m.client.Database(m.dbName).Collection(m.DocumentTable()).DeleteMany(ctx, filter)
+	return errors.Trace(err)
+}
+
+func (m MongoDB) AddTimeSeriesPoints(ctx context.Context, points []TimeSeriesPoint) error {
+	var models []mongo.WriteModel
+	for _, point := range points {
+		models = append(models, mongo.NewUpdateOneModel().
+			SetUpsert(true).
+			SetFilter(bson.M{
+				"name":      point.Name,
+				"timestamp": point.Timestamp,
+			}).
+			SetUpdate(bson.M{"$set": bson.M{
+				"value": point.Value,
+			}}))
+	}
+	_, err := m.client.Database(m.dbName).Collection(m.PointsTable()).BulkWrite(ctx, models)
+	return errors.Trace(err)
+}
+
+func (m MongoDB) GetTimeSeriesPoints(ctx context.Context, name string, begin, end time.Time) ([]TimeSeriesPoint, error) {
+	cur, err := m.client.Database(m.dbName).Collection(m.PointsTable()).Find(ctx, bson.M{
+		"name":      name,
+		"timestamp": bson.M{"$gte": begin, "$lt": end},
+	}, options.Find().SetSort(bson.M{"timestamp": 1}))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	points := make([]TimeSeriesPoint, 0)
+	for cur.Next(ctx) {
+		var point TimeSeriesPoint
+		if err = cur.Decode(&point); err != nil {
+			return nil, errors.Trace(err)
+		}
+		points = append(points, point)
+	}
+	return points, nil
 }

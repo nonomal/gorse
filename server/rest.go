@@ -15,44 +15,55 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/pprof"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/araddon/dateparse"
+	mapset "github.com/deckarep/golang-set/v2"
 	restfulspec "github.com/emicklei/go-restful-openapi/v2"
 	"github.com/emicklei/go-restful/v3"
 	"github.com/google/uuid"
 	"github.com/juju/errors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/samber/lo"
-	"github.com/scylladb/go-set"
-	"github.com/scylladb/go-set/strset"
 	"github.com/thoas/go-funk"
 	"github.com/zhenghaoz/gorse/base/heap"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/emicklei/go-restful/otelrestful"
 	"go.uber.org/zap"
-	"math"
+	"google.golang.org/protobuf/proto"
 	"modernc.org/mathutil"
-	"net/http"
-	"strconv"
-	"strings"
-	"time"
+)
+
+const (
+	HealthAPITag         = "health"
+	UsersAPITag          = "users"
+	ItemsAPITag          = "items"
+	FeedbackAPITag       = "feedback"
+	RecommendationAPITag = "recommendation"
+	MeasurementsAPITag   = "measurements"
+	DetractedAPITag      = "deprecated"
 )
 
 // RestServer implements a REST-ful API server.
 type RestServer struct {
 	*config.Settings
 
-	HttpHost   string
-	HttpPort   int
+	HttpHost string
+	HttpPort int
+
 	DisableLog bool
 	WebService *restful.WebService
 	HttpServer *http.Server
-
-	PopularItemsCache  *PopularItemsCache
-	HiddenItemsManager *HiddenItemsManager
 }
 
 // StartHttpServer starts the REST-ful API server.
@@ -70,9 +81,33 @@ func (s *RestServer) StartHttpServer(container *restful.Container) {
 	container.Handle(apiDocsPath, http.HandlerFunc(handler))
 	// register prometheus
 	container.Handle("/metrics", promhttp.Handler())
+	// register pprof
+	container.Handle("/debug/pprof/", http.HandlerFunc(pprof.Index))
+	container.Handle("/debug/pprof/cmdline", http.HandlerFunc(pprof.Cmdline))
+	container.Handle("/debug/pprof/profile", http.HandlerFunc(pprof.Profile))
+	container.Handle("/debug/pprof/symbol", http.HandlerFunc(pprof.Symbol))
+	container.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
+	container.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
+	container.Handle("/debug/pprof/block", pprof.Handler("block"))
+	container.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+	container.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+	container.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
+	container.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+
+	// Add container filter to enable CORS
+	cors := restful.CrossOriginResourceSharing{
+		AllowedHeaders: []string{"Content-Type", "Accept", "X-API-Key"},
+		AllowedDomains: s.Config.Master.HttpCorsDomains,
+		AllowedMethods: s.Config.Master.HttpCorsMethods,
+		CookiesAllowed: false,
+		Container:      container}
+	container.Filter(cors.Filter)
 
 	log.Logger().Info("start http server",
-		zap.String("url", fmt.Sprintf("http://%s:%d", s.HttpHost, s.HttpPort)))
+		zap.String("url", fmt.Sprintf("http://%s:%d", s.HttpHost, s.HttpPort)),
+		zap.Strings("cors_methods", s.Config.Master.HttpCorsMethods),
+		zap.Strings("cors_domains", s.Config.Master.HttpCorsDomains),
+	)
 	s.HttpServer = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", s.HttpHost, s.HttpPort),
 		Handler: container,
@@ -99,6 +134,11 @@ func (s *RestServer) LogFilter(req *restful.Request, resp *restful.Response, cha
 }
 
 func (s *RestServer) AuthFilter(req *restful.Request, resp *restful.Response, chain *restful.FilterChain) {
+	if strings.HasPrefix(req.SelectedRoute().Path(), "/api/health/") {
+		// Health check APIs don't need API key,
+		chain.ProcessFilter(req, resp)
+		return
+	}
 	if s.Config.Server.APIKey == "" {
 		chain.ProcessFilter(req, resp)
 		return
@@ -136,363 +176,395 @@ func (s *RestServer) CreateWebService() {
 		Produces(restful.MIME_JSON).
 		Filter(s.LogFilter).
 		Filter(s.AuthFilter).
-		Filter(s.MetricsFilter)
+		Filter(s.MetricsFilter).
+		Filter(otelrestful.OTelFilter("gorse"))
 
-	/* Interactions with data store */
+	/* Health check */
+	ws.Route(ws.GET("/health/live").To(s.checkLive).
+		Doc("Probe the liveness of this node. Return OK once the server starts.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{HealthAPITag}).
+		Returns(http.StatusOK, "OK", HealthStatus{}).
+		Writes(HealthStatus{}))
+	ws.Route(ws.GET("/health/ready").To(s.checkReady).
+		Doc("Probe the readiness of this node. Return OK if the server is able to handle requests.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{HealthAPITag}).
+		Returns(http.StatusOK, "OK", HealthStatus{}).
+		Writes(HealthStatus{}))
 
 	// Insert a user
 	ws.Route(ws.POST("/user").To(s.insertUser).
 		Doc("Insert a user.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"user"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Returns(200, "OK", Success{}).
-		Reads(data.User{}))
+		Metadata(restfulspec.KeyOpenAPITags, []string{UsersAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Reads(data.User{}).
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Modify a user
 	ws.Route(ws.PATCH("/user/{user-id}").To(s.modifyUser).
 		Doc("Modify a user.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"user"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{UsersAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to modify").DataType("string")).
 		Reads(data.UserPatch{}).
-		Returns(200, "OK", Success{}))
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Get a user
 	ws.Route(ws.GET("/user/{user-id}").To(s.getUser).
 		Doc("Get a user.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"user"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Returns(200, "OK", data.User{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{UsersAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to get").DataType("string")).
+		Returns(http.StatusOK, "OK", data.User{}).
 		Writes(data.User{}))
 	// Insert users
 	ws.Route(ws.POST("/users").To(s.insertUsers).
 		Doc("Insert users.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"user"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Returns(200, "OK", Success{}).
-		Reads([]data.User{}))
+		Metadata(restfulspec.KeyOpenAPITags, []string{UsersAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Reads([]data.User{}).
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Get users
 	ws.Route(ws.GET("/users").To(s.getUsers).
 		Doc("Get users.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"user"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned users").DataType("integer")).
-		Param(ws.QueryParameter("cursor", "cursor for next page").DataType("string")).
-		Returns(200, "OK", UserIterator{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{UsersAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned users").DataType("integer")).
+		Param(ws.QueryParameter("cursor", "Cursor for the next page").DataType("string")).
+		Returns(http.StatusOK, "OK", UserIterator{}).
 		Writes(UserIterator{}))
 	// Delete a user
 	ws.Route(ws.DELETE("/user/{user-id}").To(s.deleteUser).
 		Doc("Delete a user and his or her feedback.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"user"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Returns(200, "OK", Success{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{UsersAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to delete").DataType("string")).
+		Returns(http.StatusOK, "OK", Success{}).
 		Writes(Success{}))
 
 	// Insert an item
 	ws.Route(ws.POST("/item").To(s.insertItem).
 		Doc("Insert an item. Overwrite if the item exists.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Returns(200, "OK", Success{}).
-		Reads(data.Item{}))
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Reads(data.Item{}).
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Modify an item
 	ws.Route(ws.PATCH("/item/{item-id}").To(s.modifyItem).
 		Doc("Modify an item.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to modify").DataType("string")).
 		Reads(data.ItemPatch{}).
-		Returns(200, "OK", Success{}))
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Get items
 	ws.Route(ws.GET("/items").To(s.getItems).
 		Doc("Get items.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("cursor", "cursor for next page").DataType("string")).
-		Returns(200, "OK", ItemIterator{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("cursor", "Cursor for the next page").DataType("string")).
+		Returns(http.StatusOK, "OK", ItemIterator{}).
 		Writes(ItemIterator{}))
 	// Get item
 	ws.Route(ws.GET("/item/{item-id}").To(s.getItem).
 		Doc("Get a item.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", data.Item{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to get.").DataType("string")).
+		Returns(http.StatusOK, "OK", data.Item{}).
 		Writes(data.Item{}))
 	// Insert items
 	ws.Route(ws.POST("/items").To(s.insertItems).
 		Doc("Insert items. Overwrite if items exist").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Reads([]data.Item{}))
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Reads([]data.Item{}).
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Delete item
 	ws.Route(ws.DELETE("/item/{item-id}").To(s.deleteItem).
 		Doc("Delete an item and its feedback.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", Success{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to delete").DataType("string")).
+		Returns(http.StatusOK, "OK", Success{}).
 		Writes(Success{}))
 	// Insert category
 	ws.Route(ws.PUT("/item/{item-id}/category/{category}").To(s.insertItemCategory).
-		Doc("Insert a category for a item").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Param(ws.PathParameter("category", "item category").DataType("string")).
-		Returns(200, "OK", Success{}).
+		Doc("Insert a category for a item.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to insert category").DataType("string")).
+		Param(ws.PathParameter("category", "Category to insert").DataType("string")).
+		Returns(http.StatusOK, "OK", Success{}).
 		Writes(Success{}))
 	// Delete category
 	ws.Route(ws.DELETE("/item/{item-id}/category/{category}").To(s.deleteItemCategory).
-		Doc("Delete a category from a item").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"item"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Param(ws.PathParameter("category", "item category").DataType("string")).
-		Returns(200, "OK", Success{}).
+		Doc("Delete a category from a item.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{ItemsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to delete categoryßßß").DataType("string")).
+		Param(ws.PathParameter("category", "Category to delete").DataType("string")).
+		Returns(http.StatusOK, "OK", Success{}).
 		Writes(Success{}))
-
 	// Insert feedback
 	ws.Route(ws.POST("/feedback").To(s.insertFeedback(false)).
 		Doc("Insert feedbacks. Ignore insertion if feedback exists.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
 		Reads([]data.Feedback{}).
-		Returns(200, "OK", Success{}))
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	ws.Route(ws.PUT("/feedback").To(s.insertFeedback(true)).
 		Doc("Insert feedbacks. Existed feedback will be overwritten.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
 		Reads([]data.Feedback{}).
-		Returns(200, "OK", Success{}))
+		Returns(http.StatusOK, "OK", Success{}).
+		Writes(Success{}))
 	// Get feedback
 	ws.Route(ws.GET("/feedback").To(s.getFeedback).
 		Doc("Get feedbacks.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("cursor", "cursor for next page").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned feedback").DataType("integer")).
-		Returns(200, "OK", FeedbackIterator{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("cursor", "Cursor for the next page").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned feedback").DataType("integer")).
+		Returns(http.StatusOK, "OK", FeedbackIterator{}).
 		Writes(FeedbackIterator{}))
 	ws.Route(ws.GET("/feedback/{user-id}/{item-id}").To(s.getUserItemFeedback).
 		Doc("Get feedbacks between a user and a item.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", []data.Feedback{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("item-id", "Item ID of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", []data.Feedback{}).
 		Writes([]data.Feedback{}))
 	ws.Route(ws.DELETE("/feedback/{user-id}/{item-id}").To(s.deleteUserItemFeedback).
 		Doc("Delete feedbacks between a user and a item.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", []data.Feedback{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("item-id", "Item ID of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", []data.Feedback{}).
 		Writes([]data.Feedback{}))
 	ws.Route(ws.GET("/feedback/{feedback-type}").To(s.getTypedFeedback).
 		Doc("Get feedbacks with feedback type.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("feedback-type", "feedback type").DataType("string")).
-		Param(ws.QueryParameter("cursor", "cursor for next page").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned feedback").DataType("integer")).
-		Returns(200, "OK", FeedbackIterator{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("feedback-type", "Type of returned feedbacks").DataType("string")).
+		Param(ws.QueryParameter("cursor", "Cursor for the next page").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned feedbacks").DataType("integer")).
+		Returns(http.StatusOK, "OK", FeedbackIterator{}).
 		Writes(FeedbackIterator{}))
 	ws.Route(ws.GET("/feedback/{feedback-type}/{user-id}/{item-id}").To(s.getTypedUserItemFeedback).
 		Doc("Get feedbacks between a user and a item with feedback type.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("feedback-type", "feedback type").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", data.Feedback{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("feedback-type", "Type of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("item-id", "Item ID of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", data.Feedback{}).
 		Writes(data.Feedback{}))
 	ws.Route(ws.DELETE("/feedback/{feedback-type}/{user-id}/{item-id}").To(s.deleteTypedUserItemFeedback).
 		Doc("Delete feedbacks between a user and a item with feedback type.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("feedback-type", "feedback type").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", data.Feedback{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("feedback-type", "Type of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("item-id", "Item ID of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", data.Feedback{}).
 		Writes(data.Feedback{}))
 	// Get feedback by user id
 	ws.Route(ws.GET("/user/{user-id}/feedback/{feedback-type}").To(s.getTypedFeedbackByUser).
 		Doc("Get feedbacks by user id with feedback type.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.PathParameter("feedback-type", "feedback type").DataType("string")).
-		Returns(200, "OK", []data.Feedback{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("feedback-type", "Type of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", []data.Feedback{}).
 		Writes([]data.Feedback{}))
 	ws.Route(ws.GET("/user/{user-id}/feedback").To(s.getFeedbackByUser).
 		Doc("Get feedbacks by user id.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Returns(200, "OK", []data.Feedback{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "User ID of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", []data.Feedback{}).
 		Writes([]data.Feedback{}))
 	// Get feedback by item-id
 	ws.Route(ws.GET("/item/{item-id}/feedback/{feedback-type}").To(s.getTypedFeedbackByItem).
 		Doc("Get feedbacks by item id with feedback type.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Param(ws.PathParameter("feedback-type", "feedback type").DataType("string")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "Item ID of returned feedbacks").DataType("string")).
+		Param(ws.PathParameter("feedback-type", "Type of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", []data.Feedback{}).
+		Writes([]data.Feedback{}))
 	ws.Route(ws.GET("/item/{item-id}/feedback/").To(s.getFeedbackByItem).
 		Doc("Get feedbacks by item id.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"feedback"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
-
-	/* Interaction with intermediate result */
+		Metadata(restfulspec.KeyOpenAPITags, []string{FeedbackAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "Item ID of returned feedbacks").DataType("string")).
+		Returns(http.StatusOK, "OK", []data.Feedback{}).
+		Writes([]data.Feedback{}))
 
 	// Get collaborative filtering recommendation by user id
 	ws.Route(ws.GET("/intermediate/recommend/{user-id}").To(s.getCollaborative).
-		Doc("get the collaborative filtering recommendation for a user").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"intermediate"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of the list").DataType("integer")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get the collaborative filtering recommendation for a user").
+		Metadata(restfulspec.KeyOpenAPITags, []string{DetractedAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to get recommendation").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/intermediate/recommend/{user-id}/{category}").To(s.getCollaborative).
-		Doc("get the collaborative filtering recommendation for a user").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"intermediate"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "identifier of the user").DataType("string")).
-		Param(ws.PathParameter("category", "category of items").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of the list").DataType("integer")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
-
-	/* Rank recommendation */
+		Doc("Get the collaborative filtering recommendation for a user").
+		Metadata(restfulspec.KeyOpenAPITags, []string{DetractedAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to get recommendation").DataType("string")).
+		Param(ws.PathParameter("category", "Category of returned items.").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 
 	// Get popular items
 	ws.Route(ws.GET("/popular").To(s.getPopular).
-		Doc("Get popular items").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned recommendations").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned recommendations").DataType("integer")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get popular items.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("category", "Category of returned items").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned recommendations").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned recommendations").DataType("integer")).
+		Param(ws.QueryParameter("user-id", "Remove read items of a user").DataType("string")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/popular/{category}").To(s.getPopular).
-		Doc("Get popular items in category").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("category", "item category").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(http.StatusOK, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get popular items in category.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("category", "Category of returned items.").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Param(ws.QueryParameter("user-id", "Remove read items of a user").DataType("string")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	// Get latest items
 	ws.Route(ws.GET("/latest").To(s.getLatest).
-		Doc("get latest items").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(200, "OK", []cache.Scored{}).
-		Writes([]cache.Scored{}))
+		Doc("Get the latest items.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("category", "Category of returned items").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Param(ws.QueryParameter("user-id", "Remove read items of a user").DataType("string")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/latest/{category}").To(s.getLatest).
-		Doc("get latest items in category").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("category", "items category").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(http.StatusOK, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get the latest items in category.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("category", "Category of returned items.").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Param(ws.QueryParameter("user-id", "Remove read items of a user").DataType("string")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
+	// Get non-personalized
+	ws.Route(ws.GET("/non-personalized/{name}").To(s.getNonPersonalized).
+		Doc("Get non-personalized recommendations.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("category", "Category of returned items.").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned users").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned users").DataType("integer")).
+		Param(ws.QueryParameter("user-id", "Remove read items of a user").DataType("string")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	// Get neighbors
 	ws.Route(ws.GET("/item/{item-id}/neighbors/").To(s.getItemNeighbors).
-		Doc("get neighbors of a item").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get neighbors of a item").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to get neighbors").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/item/{item-id}/neighbors/{category}").To(s.getItemNeighbors).
-		Doc("get neighbors of a item").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("item-id", "item id").DataType("string")).
-		Param(ws.PathParameter("category", "item category").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get neighbors of a item in category.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("item-id", "ID of the item to get neighbors").DataType("string")).
+		Param(ws.PathParameter("category", "Category of returned items").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/user/{user-id}/neighbors/").To(s.getUserNeighbors).
-		Doc("get neighbors of a user").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned users").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned users").DataType("integer")).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Doc("Get neighbors of a user.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to get neighbors").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned users").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned users").DataType("integer")).
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.GET("/recommend/{user-id}").To(s.getRecommend).
 		Doc("Get recommendation for user.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.QueryParameter("write-back-type", "type of write back feedback").DataType("string")).
-		Param(ws.QueryParameter("write-back-delay", "timestamp delay of write back feedback").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(200, "OK", []string{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to get recommendation").DataType("string")).
+		Param(ws.QueryParameter("category", "Category of the returned items (support multi-categories filtering)").DataType("string")).
+		Param(ws.QueryParameter("write-back-type", "Type of write back feedback").DataType("string")).
+		Param(ws.QueryParameter("write-back-delay", "Timestamp delay of write back feedback (format 0h0m0s)").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", []string{}).
 		Writes([]string{}))
 	ws.Route(ws.GET("/recommend/{user-id}/{category}").To(s.getRecommend).
 		Doc("Get recommendation for user.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("user-id", "user id").DataType("string")).
-		Param(ws.PathParameter("category", "item category").DataType("string")).
-		Param(ws.QueryParameter("write-back-type", "type of write back feedback").DataType("string")).
-		Param(ws.QueryParameter("write-back-delay", "timestamp delay of write back feedback").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
-		Returns(200, "OK", []string{}).
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("user-id", "ID of the user to get recommendation").DataType("string")).
+		Param(ws.PathParameter("category", "Category of the returned items").DataType("string")).
+		Param(ws.QueryParameter("write-back-type", "Type of write back feedback").DataType("string")).
+		Param(ws.QueryParameter("write-back-delay", "Timestamp delay of write back feedback (format 0h0m0s)").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
+		Returns(http.StatusOK, "OK", []string{}).
 		Writes([]string{}))
 	ws.Route(ws.POST("/session/recommend").To(s.sessionRecommend).
 		Doc("Get recommendation for session.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
 		Reads([]Feedback{}).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 	ws.Route(ws.POST("/session/recommend/{category}").To(s.sessionRecommend).
 		Doc("Get recommendation for session.").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"recommendation"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.PathParameter("category", "item category").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned items").DataType("integer")).
-		Param(ws.QueryParameter("offset", "offset of returned items").DataType("integer")).
+		Metadata(restfulspec.KeyOpenAPITags, []string{RecommendationAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("category", "Category of the returned items").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned items").DataType("integer")).
+		Param(ws.QueryParameter("offset", "Offset of returned items").DataType("integer")).
 		Reads([]Feedback{}).
-		Returns(200, "OK", []string{}).
-		Writes([]string{}))
-
-	/* Interaction with measurements */
+		Returns(http.StatusOK, "OK", []cache.Score{}).
+		Writes([]cache.Score{}))
 
 	ws.Route(ws.GET("/measurements/{name}").To(s.getMeasurements).
-		Doc("Get measurements").
-		Metadata(restfulspec.KeyOpenAPITags, []string{"measurements"}).
-		Param(ws.HeaderParameter("X-API-Key", "api key").DataType("string")).
-		Param(ws.QueryParameter("n", "number of returned measurements.").DataType("integer")).
-		Returns(200, "OK", []Measurement{}).
-		Writes([]Measurement{}))
+		Doc("Get measurements.").
+		Metadata(restfulspec.KeyOpenAPITags, []string{MeasurementsAPITag}).
+		Param(ws.HeaderParameter("X-API-Key", "API key").DataType("string")).
+		Param(ws.PathParameter("name", "Name of returned measurements").DataType("string")).
+		Param(ws.QueryParameter("n", "Number of returned measurements").DataType("integer")).
+		Returns(http.StatusOK, "OK", []cache.TimeSeriesPoint{}).
+		Writes([]cache.TimeSeriesPoint{}))
 }
 
 // ParseInt parses integers from the query parameter.
@@ -515,10 +587,19 @@ func ParseDuration(request *restful.Request, name string) (time.Duration, error)
 	return time.ParseDuration(valueString)
 }
 
-func (s *RestServer) getSort(key, category string, isItem bool, request *restful.Request, response *restful.Response) {
-	var n, offset int
-	var err error
-	// read arguments
+func (s *RestServer) SearchDocuments(collection, subset string, categories []string,
+	iteratee func(item cache.Score) (any, error),
+	request *restful.Request, response *restful.Response,
+) {
+	var (
+		ctx    = request.Request.Context()
+		n      int
+		offset int
+		userId string
+		err    error
+	)
+
+	// parse arguments
 	if offset, err = ParseInt(request, "offset", 0); err != nil {
 		BadRequest(response, err)
 		return
@@ -527,39 +608,91 @@ func (s *RestServer) getSort(key, category string, isItem bool, request *restful
 		BadRequest(response, err)
 		return
 	}
-	// Get the popular list
-	items, err := s.CacheClient.GetSorted(cache.Key(key, category), offset, s.Config.Recommend.CacheSize)
+	userId = request.QueryParameter("user-id")
+
+	readItems := mapset.NewSet[string]()
+	if userId != "" {
+		feedback, err := s.DataClient.GetUserFeedback(ctx, userId, s.Config.Now())
+		if err != nil {
+			InternalServerError(response, err)
+			return
+		}
+		for _, f := range feedback {
+			readItems.Add(f.ItemId)
+		}
+	}
+
+	end := offset + n
+	if end > 0 && readItems.Cardinality() > 0 {
+		end += readItems.Cardinality()
+	}
+
+	// Get the sorted list
+	items, err := s.CacheClient.SearchScores(ctx, collection, subset, categories, offset, end)
 	if err != nil {
 		InternalServerError(response, err)
 		return
 	}
-	if isItem {
-		items = s.FilterOutHiddenScores(response, items, category)
+
+	// Remove read items
+	if userId != "" {
+		prunedItems := make([]cache.Score, 0, len(items))
+		for _, item := range items {
+			if !readItems.Contains(item.Id) {
+				prunedItems = append(prunedItems, item)
+			}
+		}
+		items = prunedItems
 	}
+
+	// Send result
 	if n > 0 && len(items) > n {
 		items = items[:n]
 	}
-	// Send result
-	Ok(response, items)
+	if iteratee != nil {
+		var results []any
+		for _, item := range items {
+			result, err := iteratee(item)
+			if err != nil {
+				InternalServerError(response, err)
+				return
+			}
+			results = append(results, result)
+		}
+		Ok(response, results)
+	} else {
+		Ok(response, items)
+	}
 }
 
 func (s *RestServer) getPopular(request *restful.Request, response *restful.Response) {
-	category := request.PathParameter("category")
-	log.ResponseLogger(response).Debug("get category popular items in category", zap.String("category", category))
-	s.getSort(cache.PopularItems, category, true, request, response)
+	categories := ReadCategories(request)
+	log.ResponseLogger(response).Debug("get category popular items in category", zap.Strings("categories", categories))
+	s.SearchDocuments(cache.NonPersonalized, cache.Popular, categories, nil, request, response)
 }
 
 func (s *RestServer) getLatest(request *restful.Request, response *restful.Response) {
-	category := request.PathParameter("category")
-	log.ResponseLogger(response).Debug("get category latest items in category", zap.String("category", category))
-	s.getSort(cache.LatestItems, category, true, request, response)
+	categories := ReadCategories(request)
+	log.ResponseLogger(response).Debug("get category latest items in category", zap.Strings("categories", categories))
+	s.SearchDocuments(cache.NonPersonalized, cache.Latest, categories, nil, request, response)
+}
+
+func (s *RestServer) getNonPersonalized(request *restful.Request, response *restful.Response) {
+	name := request.PathParameter("name")
+	categories := ReadCategories(request)
+	log.ResponseLogger(response).Debug("get leaderboard", zap.String("name", name))
+	s.SearchDocuments(cache.NonPersonalized, name, categories, nil, request, response)
 }
 
 // get feedback by item-id with feedback type
 func (s *RestServer) getTypedFeedbackByItem(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	feedbackType := request.PathParameter("feedback-type")
 	itemId := request.PathParameter("item-id")
-	feedback, err := s.DataClient.GetItemFeedback(itemId, feedbackType)
+	feedback, err := s.DataClient.GetItemFeedback(ctx, itemId, feedbackType)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -569,8 +702,12 @@ func (s *RestServer) getTypedFeedbackByItem(request *restful.Request, response *
 
 // get feedback by item-id
 func (s *RestServer) getFeedbackByItem(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	itemId := request.PathParameter("item-id")
-	feedback, err := s.DataClient.GetItemFeedback(itemId)
+	feedback, err := s.DataClient.GetItemFeedback(ctx, itemId)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -582,77 +719,77 @@ func (s *RestServer) getFeedbackByItem(request *restful.Request, response *restf
 func (s *RestServer) getItemNeighbors(request *restful.Request, response *restful.Response) {
 	// Get item id
 	itemId := request.PathParameter("item-id")
-	category := request.PathParameter("category")
-	s.getSort(cache.Key(cache.ItemNeighbors, itemId), category, true, request, response)
+	categories := ReadCategories(request)
+	s.SearchDocuments(cache.ItemNeighbors, itemId, categories, nil, request, response)
 }
 
 // getUserNeighbors gets neighbors of a user from database.
 func (s *RestServer) getUserNeighbors(request *restful.Request, response *restful.Response) {
 	// Get item id
 	userId := request.PathParameter("user-id")
-	s.getSort(cache.Key(cache.UserNeighbors, userId), "", false, request, response)
+	s.SearchDocuments(cache.UserNeighbors, userId, []string{""}, nil, request, response)
 }
 
 // getCollaborative gets cached recommended items from database.
 func (s *RestServer) getCollaborative(request *restful.Request, response *restful.Response) {
 	// Get user id
 	userId := request.PathParameter("user-id")
-	category := request.PathParameter("category")
-	s.getSort(cache.Key(cache.OfflineRecommend, userId), category, true, request, response)
+	categories := ReadCategories(request)
+	s.SearchDocuments(cache.OfflineRecommend, userId, categories, nil, request, response)
 }
 
 // Recommend items to users.
 // 1. If there are recommendations in cache, return cached recommendations.
 // 2. If there are historical interactions of the users, return similar items.
 // 3. Otherwise, return fallback recommendation (popular/latest).
-func (s *RestServer) Recommend(response *restful.Response, userId, category string, n int, recommenders ...Recommender) ([]string, error) {
+func (s *RestServer) Recommend(ctx context.Context, response *restful.Response, userId string, categories []string, n int, recommenders ...Recommender) ([]string, error) {
 	initStart := time.Now()
 
 	// create context
-	ctx, err := s.createRecommendContext(userId, category, n)
+	recommendCtx, err := s.createRecommendContext(ctx, userId, categories, n)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	// execute recommenders
 	for _, recommender := range recommenders {
-		err = recommender(ctx)
+		err = recommender(recommendCtx)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 	}
 
 	// return recommendations
-	if len(ctx.results) > n {
-		ctx.results = ctx.results[:n]
+	if len(recommendCtx.results) > n {
+		recommendCtx.results = recommendCtx.results[:n]
 	}
 	totalTime := time.Since(initStart)
 	log.ResponseLogger(response).Info("complete recommendation",
-		zap.Int("num_from_final", ctx.numFromOffline),
-		zap.Int("num_from_collaborative", ctx.numFromCollaborative),
-		zap.Int("num_from_item_based", ctx.numFromItemBased),
-		zap.Int("num_from_user_based", ctx.numFromUserBased),
-		zap.Int("num_from_latest", ctx.numFromLatest),
-		zap.Int("num_from_poplar", ctx.numFromPopular),
+		zap.Int("num_from_final", recommendCtx.numFromOffline),
+		zap.Int("num_from_collaborative", recommendCtx.numFromCollaborative),
+		zap.Int("num_from_item_based", recommendCtx.numFromItemBased),
+		zap.Int("num_from_user_based", recommendCtx.numFromUserBased),
+		zap.Int("num_from_latest", recommendCtx.numFromLatest),
+		zap.Int("num_from_poplar", recommendCtx.numFromPopular),
 		zap.Duration("total_time", totalTime),
-		zap.Duration("load_final_recommend_time", ctx.loadOfflineRecTime),
-		zap.Duration("load_col_recommend_time", ctx.loadColRecTime),
-		zap.Duration("load_hist_time", ctx.loadLoadHistTime),
-		zap.Duration("item_based_recommend_time", ctx.itemBasedTime),
-		zap.Duration("user_based_recommend_time", ctx.userBasedTime),
-		zap.Duration("load_latest_time", ctx.loadLatestTime),
-		zap.Duration("load_popular_time", ctx.loadPopularTime))
-	return ctx.results, nil
+		zap.Duration("load_final_recommend_time", recommendCtx.loadOfflineRecTime),
+		zap.Duration("load_col_recommend_time", recommendCtx.loadColRecTime),
+		zap.Duration("load_hist_time", recommendCtx.loadLoadHistTime),
+		zap.Duration("item_based_recommend_time", recommendCtx.itemBasedTime),
+		zap.Duration("user_based_recommend_time", recommendCtx.userBasedTime),
+		zap.Duration("load_latest_time", recommendCtx.loadLatestTime),
+		zap.Duration("load_popular_time", recommendCtx.loadPopularTime))
+	return recommendCtx.results, nil
 }
 
 type recommendContext struct {
-	response     *restful.Response
+	context      context.Context
 	userId       string
-	category     string
+	categories   []string
 	userFeedback []data.Feedback
 	n            int
 	results      []string
-	excludeSet   *strset.Set
+	excludeSet   mapset.Set[string]
 
 	numPrevStage         int
 	numFromLatest        int
@@ -671,73 +808,26 @@ type recommendContext struct {
 	loadPopularTime    time.Duration
 }
 
-func (s *RestServer) createRecommendContext(userId, category string, n int) (*recommendContext, error) {
-	// pull ignored items
-	ignoreItems, err := s.CacheClient.GetSortedByScore(cache.Key(cache.IgnoreItems, userId),
-		math.Inf(-1), float64(time.Now().Add(s.Config.Server.ClockError).Unix()))
+func (s *RestServer) createRecommendContext(ctx context.Context, userId string, categories []string, n int) (*recommendContext, error) {
+	// pull historical feedback
+	userFeedback, err := s.DataClient.GetUserFeedback(ctx, userId, s.Config.Now())
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	excludeSet := strset.New()
-	for _, item := range ignoreItems {
-		excludeSet.Add(item.Id)
+	excludeSet := mapset.NewSet[string]()
+	for _, item := range userFeedback {
+		if !s.Config.Recommend.Replacement.EnableReplacement {
+			excludeSet.Add(item.ItemId)
+		}
 	}
 	return &recommendContext{
-		userId:     userId,
-		category:   category,
-		n:          n,
-		excludeSet: excludeSet,
+		userId:       userId,
+		categories:   categories,
+		n:            n,
+		excludeSet:   excludeSet,
+		userFeedback: userFeedback,
+		context:      ctx,
 	}, nil
-}
-
-func (s *RestServer) requireUserFeedback(ctx *recommendContext) error {
-	if ctx.userFeedback == nil {
-		start := time.Now()
-		var err error
-		ctx.userFeedback, err = s.DataClient.GetUserFeedback(ctx.userId, false)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		for _, feedback := range ctx.userFeedback {
-			ctx.excludeSet.Add(feedback.ItemId)
-		}
-		ctx.loadLoadHistTime = time.Since(start)
-	}
-	return nil
-}
-
-func (s *RestServer) FilterOutHiddenScores(response *restful.Response, items []cache.Scored, category string) []cache.Scored {
-	isHidden, err := s.HiddenItemsManager.IsHidden(cache.RemoveScores(items), category)
-	if err != nil {
-		log.ResponseLogger(response).Error("failed to check hidden items", zap.Error(err))
-		return items
-	}
-	results := make([]cache.Scored, 0, len(items))
-	for i := range isHidden {
-		if !isHidden[i] {
-			results = append(results, items[i])
-		}
-	}
-	return results
-}
-
-func (s *RestServer) filterOutHiddenFeedback(response *restful.Response, feedbacks []data.Feedback) []data.Feedback {
-	names := make([]string, len(feedbacks))
-	for i, item := range feedbacks {
-		names[i] = item.ItemId
-	}
-	isHidden, err := s.HiddenItemsManager.IsHidden(names, "")
-	if err != nil {
-		log.ResponseLogger(response).Error("failed to check hidden items", zap.Error(err))
-		return feedbacks
-	}
-	var results []data.Feedback
-	for i := range isHidden {
-		if !isHidden[i] {
-			results = append(results, feedbacks[i])
-		}
-	}
-	return results
 }
 
 type Recommender func(ctx *recommendContext) error
@@ -745,13 +835,12 @@ type Recommender func(ctx *recommendContext) error
 func (s *RestServer) RecommendOffline(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
 		start := time.Now()
-		recommendation, err := s.CacheClient.GetSorted(cache.Key(cache.OfflineRecommend, ctx.userId, ctx.category), 0, s.Config.Recommend.CacheSize)
+		recommendation, err := s.CacheClient.SearchScores(ctx.context, cache.OfflineRecommend, ctx.userId, ctx.categories, 0, s.Config.Recommend.CacheSize)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		recommendation = s.FilterOutHiddenScores(ctx.response, recommendation, ctx.category)
 		for _, item := range recommendation {
-			if !ctx.excludeSet.Has(item.Id) {
+			if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
 				ctx.excludeSet.Add(item.Id)
 			}
@@ -766,13 +855,12 @@ func (s *RestServer) RecommendOffline(ctx *recommendContext) error {
 func (s *RestServer) RecommendCollaborative(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
 		start := time.Now()
-		collaborativeRecommendation, err := s.CacheClient.GetSorted(cache.Key(cache.CollaborativeRecommend, ctx.userId, ctx.category), 0, s.Config.Recommend.CacheSize)
+		collaborativeRecommendation, err := s.CacheClient.SearchScores(ctx.context, cache.CollaborativeRecommend, ctx.userId, ctx.categories, 0, s.Config.Recommend.CacheSize)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		collaborativeRecommendation = s.FilterOutHiddenScores(ctx.response, collaborativeRecommendation, ctx.category)
 		for _, item := range collaborativeRecommendation {
-			if !ctx.excludeSet.Has(item.Id) {
+			if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
 				ctx.excludeSet.Add(item.Id)
 			}
@@ -786,32 +874,27 @@ func (s *RestServer) RecommendCollaborative(ctx *recommendContext) error {
 
 func (s *RestServer) RecommendUserBased(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
-		err := s.requireUserFeedback(ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
 		start := time.Now()
 		candidates := make(map[string]float64)
 		// load similar users
-		similarUsers, err := s.CacheClient.GetSorted(cache.Key(cache.UserNeighbors, ctx.userId), 0, s.Config.Recommend.CacheSize)
+		similarUsers, err := s.CacheClient.SearchScores(ctx.context, cache.UserNeighbors, ctx.userId, []string{""}, 0, s.Config.Recommend.CacheSize)
 		if err != nil {
 			return errors.Trace(err)
 		}
 		for _, user := range similarUsers {
 			// load historical feedback
-			feedbacks, err := s.DataClient.GetUserFeedback(user.Id, false, s.Config.Recommend.DataSource.PositiveFeedbackTypes...)
+			feedbacks, err := s.DataClient.GetUserFeedback(ctx.context, user.Id, s.Config.Now(), s.Config.Recommend.DataSource.PositiveFeedbackTypes...)
 			if err != nil {
 				return errors.Trace(err)
 			}
-			feedbacks = s.filterOutHiddenFeedback(ctx.response, feedbacks)
 			// add unseen items
 			for _, feedback := range feedbacks {
-				if !ctx.excludeSet.Has(feedback.ItemId) {
-					item, err := s.DataClient.GetItem(feedback.ItemId)
+				if !ctx.excludeSet.Contains(feedback.ItemId) {
+					item, err := s.DataClient.GetItem(ctx.context, feedback.ItemId)
 					if err != nil {
 						return errors.Trace(err)
 					}
-					if ctx.category == "" || funk.ContainsString(item.Categories, ctx.category) {
+					if funk.Equal(ctx.categories, []string{""}) || funk.Subset(ctx.categories, item.Categories) {
 						candidates[feedback.ItemId] += user.Score
 					}
 				}
@@ -825,7 +908,7 @@ func (s *RestServer) RecommendUserBased(ctx *recommendContext) error {
 		}
 		ids, _ := filter.PopAll()
 		ctx.results = append(ctx.results, ids...)
-		ctx.excludeSet.Add(ids...)
+		ctx.excludeSet.Append(ids...)
 		ctx.userBasedTime = time.Since(start)
 		ctx.numFromUserBased = len(ctx.results) - ctx.numPrevStage
 		ctx.numPrevStage = len(ctx.results)
@@ -835,10 +918,6 @@ func (s *RestServer) RecommendUserBased(ctx *recommendContext) error {
 
 func (s *RestServer) RecommendItemBased(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
-		err := s.requireUserFeedback(ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
 		start := time.Now()
 		// truncate user feedback
 		data.SortFeedbacks(ctx.userFeedback)
@@ -855,14 +934,13 @@ func (s *RestServer) RecommendItemBased(ctx *recommendContext) error {
 		candidates := make(map[string]float64)
 		for _, feedback := range userFeedback {
 			// load similar items
-			similarItems, err := s.CacheClient.GetSorted(cache.Key(cache.ItemNeighbors, feedback.ItemId, ctx.category), 0, s.Config.Recommend.CacheSize)
+			similarItems, err := s.CacheClient.SearchScores(ctx.context, cache.ItemNeighbors, feedback.ItemId, ctx.categories, 0, s.Config.Recommend.CacheSize)
 			if err != nil {
 				return errors.Trace(err)
 			}
 			// add unseen items
-			similarItems = s.FilterOutHiddenScores(ctx.response, similarItems, ctx.category)
 			for _, item := range similarItems {
-				if !ctx.excludeSet.Has(item.Id) {
+				if !ctx.excludeSet.Contains(item.Id) {
 					candidates[item.Id] += item.Score
 				}
 			}
@@ -875,7 +953,7 @@ func (s *RestServer) RecommendItemBased(ctx *recommendContext) error {
 		}
 		ids, _ := filter.PopAll()
 		ctx.results = append(ctx.results, ids...)
-		ctx.excludeSet.Add(ids...)
+		ctx.excludeSet.Append(ids...)
 		ctx.itemBasedTime = time.Since(start)
 		ctx.numFromItemBased = len(ctx.results) - ctx.numPrevStage
 		ctx.numPrevStage = len(ctx.results)
@@ -885,18 +963,13 @@ func (s *RestServer) RecommendItemBased(ctx *recommendContext) error {
 
 func (s *RestServer) RecommendLatest(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
-		err := s.requireUserFeedback(ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
 		start := time.Now()
-		items, err := s.CacheClient.GetSorted(cache.Key(cache.LatestItems, ctx.category), 0, s.Config.Recommend.CacheSize)
+		items, err := s.CacheClient.SearchScores(ctx.context, cache.NonPersonalized, cache.Latest, ctx.categories, 0, s.Config.Recommend.CacheSize)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		items = s.FilterOutHiddenScores(ctx.response, items, ctx.category)
 		for _, item := range items {
-			if !ctx.excludeSet.Has(item.Id) {
+			if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
 				ctx.excludeSet.Add(item.Id)
 			}
@@ -910,18 +983,13 @@ func (s *RestServer) RecommendLatest(ctx *recommendContext) error {
 
 func (s *RestServer) RecommendPopular(ctx *recommendContext) error {
 	if len(ctx.results) < ctx.n {
-		err := s.requireUserFeedback(ctx)
-		if err != nil {
-			return errors.Trace(err)
-		}
 		start := time.Now()
-		items, err := s.CacheClient.GetSorted(cache.Key(cache.PopularItems, ctx.category), 0, s.Config.Recommend.CacheSize)
+		items, err := s.CacheClient.SearchScores(ctx.context, cache.NonPersonalized, cache.Popular, ctx.categories, 0, s.Config.Recommend.CacheSize)
 		if err != nil {
 			return errors.Trace(err)
 		}
-		items = s.FilterOutHiddenScores(ctx.response, items, ctx.category)
 		for _, item := range items {
-			if !ctx.excludeSet.Has(item.Id) {
+			if !ctx.excludeSet.Contains(item.Id) {
 				ctx.results = append(ctx.results, item.Id)
 				ctx.excludeSet.Add(item.Id)
 			}
@@ -934,6 +1002,10 @@ func (s *RestServer) RecommendPopular(ctx *recommendContext) error {
 }
 
 func (s *RestServer) getRecommend(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// parse arguments
 	userId := request.PathParameter("user-id")
 	n, err := ParseInt(request, "n", s.Config.Server.DefaultN)
@@ -941,7 +1013,7 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 		BadRequest(response, err)
 		return
 	}
-	category := request.PathParameter("category")
+	categories := ReadCategories(request)
 	offset, err := ParseInt(request, "offset", 0)
 	if err != nil {
 		BadRequest(response, err)
@@ -972,7 +1044,7 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 			return
 		}
 	}
-	results, err := s.Recommend(response, userId, category, offset+n, recommenders...)
+	results, err := s.Recommend(ctx, response, userId, categories, offset+n, recommenders...)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -991,13 +1063,7 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 				},
 				Timestamp: startTime.Add(writeBackDelay),
 			}
-			err = s.DataClient.BatchInsertFeedback([]data.Feedback{feedback}, false, false, false)
-			if err != nil {
-				InternalServerError(response, err)
-				return
-			}
-			// insert to cache store
-			err = s.InsertFeedbackToCache([]data.Feedback{feedback})
+			err = s.DataClient.BatchInsertFeedback(ctx, []data.Feedback{feedback}, false, false, false)
 			if err != nil {
 				InternalServerError(response, err)
 				return
@@ -1009,6 +1075,10 @@ func (s *RestServer) getRecommend(request *restful.Request, response *restful.Re
 }
 
 func (s *RestServer) sessionRecommend(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// parse arguments
 	var feedbacks []Feedback
 	if err := request.ReadEntity(&feedbacks); err != nil {
@@ -1040,7 +1110,7 @@ func (s *RestServer) sessionRecommend(request *restful.Request, response *restfu
 	data.SortFeedbacks(dataFeedback)
 
 	// item-based recommendation
-	var excludeSet = strset.New()
+	var excludeSet = mapset.NewSet[string]()
 	var userFeedback []data.Feedback
 	for _, feedback := range dataFeedback {
 		excludeSet.Add(feedback.ItemId)
@@ -1053,15 +1123,15 @@ func (s *RestServer) sessionRecommend(request *restful.Request, response *restfu
 	usedFeedbackCount := 0
 	for _, feedback := range userFeedback {
 		// load similar items
-		similarItems, err := s.CacheClient.GetSorted(cache.Key(cache.ItemNeighbors, feedback.ItemId, category), 0, s.Config.Recommend.CacheSize)
+		similarItems, err := s.CacheClient.SearchScores(ctx, cache.ItemNeighbors, feedback.ItemId, []string{category}, 0, s.Config.Recommend.CacheSize)
 		if err != nil {
 			BadRequest(response, err)
 			return
 		}
 		// add unseen items
-		similarItems = s.FilterOutHiddenScores(response, similarItems, "")
+		// similarItems = s.FilterOutHiddenScores(response, similarItems, "")
 		for _, item := range similarItems {
-			if !excludeSet.Has(item.Id) {
+			if !excludeSet.Contains(item.Id) {
 				candidates[item.Id] += item.Score
 			}
 		}
@@ -1078,7 +1148,13 @@ func (s *RestServer) sessionRecommend(request *restful.Request, response *restfu
 	for id, score := range candidates {
 		filter.Push(id, score)
 	}
-	result := cache.CreateScoredItems(filter.PopAll())
+	names, scores := filter.PopAll()
+	result := lo.Map(names, func(_ string, i int) cache.Score {
+		return cache.Score{
+			Id:    names[i],
+			Score: scores[i],
+		}
+	})
 	if len(result) > offset {
 		result = result[offset:]
 	} else {
@@ -1095,18 +1171,27 @@ type Success struct {
 }
 
 func (s *RestServer) insertUser(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	temp := data.User{}
 	// get userInfo from request and put into temp
 	if err := request.ReadEntity(&temp); err != nil {
 		BadRequest(response, err)
 		return
 	}
-	if err := s.DataClient.BatchInsertUsers([]data.User{temp}); err != nil {
+	// validate labels
+	if err := data.ValidateLabels(temp.Labels); err != nil {
+		BadRequest(response, err)
+		return
+	}
+	if err := s.DataClient.BatchInsertUsers(ctx, []data.User{temp}); err != nil {
 		InternalServerError(response, err)
 		return
 	}
 	// insert modify timestamp
-	if err := s.CacheClient.Set(cache.Time(cache.Key(cache.LastModifyUserTime, temp.UserId), time.Now())); err != nil {
+	if err := s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, temp.UserId), time.Now())); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1114,6 +1199,10 @@ func (s *RestServer) insertUser(request *restful.Request, response *restful.Resp
 }
 
 func (s *RestServer) modifyUser(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// get user id
 	userId := request.PathParameter("user-id")
 	// modify user
@@ -1122,22 +1211,31 @@ func (s *RestServer) modifyUser(request *restful.Request, response *restful.Resp
 		BadRequest(response, err)
 		return
 	}
-	if err := s.DataClient.ModifyUser(userId, patch); err != nil {
+	// validate labels
+	if err := data.ValidateLabels(patch.Labels); err != nil {
+		BadRequest(response, err)
+		return
+	}
+	if err := s.DataClient.ModifyUser(ctx, userId, patch); err != nil {
 		InternalServerError(response, err)
 		return
 	}
 	// insert modify timestamp
-	if err := s.CacheClient.Set(cache.Time(cache.Key(cache.LastModifyUserTime, userId), time.Now())); err != nil {
+	if err := s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyUserTime, userId), time.Now())); err != nil {
 		return
 	}
 	Ok(response, Success{RowAffected: 1})
 }
 
 func (s *RestServer) getUser(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// get user id
 	userId := request.PathParameter("user-id")
 	// get user
-	user, err := s.DataClient.GetUser(userId)
+	user, err := s.DataClient.GetUser(ctx, userId)
 	if err != nil {
 		if errors.Is(err, errors.NotFound) {
 			PageNotFound(response, err)
@@ -1150,14 +1248,25 @@ func (s *RestServer) getUser(request *restful.Request, response *restful.Respons
 }
 
 func (s *RestServer) insertUsers(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	var temp []data.User
 	// get param from request and put into temp
 	if err := request.ReadEntity(&temp); err != nil {
 		BadRequest(response, err)
 		return
 	}
+	// validate labels
+	for _, user := range temp {
+		if err := data.ValidateLabels(user.Labels); err != nil {
+			BadRequest(response, err)
+			return
+		}
+	}
 	// range temp and achieve user
-	if err := s.DataClient.BatchInsertUsers(temp); err != nil {
+	if err := s.DataClient.BatchInsertUsers(ctx, temp); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1166,7 +1275,7 @@ func (s *RestServer) insertUsers(request *restful.Request, response *restful.Res
 	for i, user := range temp {
 		values[i] = cache.Time(cache.Key(cache.LastModifyUserTime, user.UserId), time.Now())
 	}
-	if err := s.CacheClient.Set(values...); err != nil {
+	if err := s.CacheClient.Set(ctx, values...); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1179,6 +1288,10 @@ type UserIterator struct {
 }
 
 func (s *RestServer) getUsers(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	cursor := request.QueryParameter("cursor")
 	n, err := ParseInt(request, "n", s.Config.Server.DefaultN)
 	if err != nil {
@@ -1186,7 +1299,7 @@ func (s *RestServer) getUsers(request *restful.Request, response *restful.Respon
 		return
 	}
 	// get all users
-	cursor, users, err := s.DataClient.GetUsers(cursor, n)
+	cursor, users, err := s.DataClient.GetUsers(ctx, cursor, n)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1196,9 +1309,13 @@ func (s *RestServer) getUsers(request *restful.Request, response *restful.Respon
 
 // delete a user by user-id
 func (s *RestServer) deleteUser(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// get user-id and put into temp
 	userId := request.PathParameter("user-id")
-	if err := s.DataClient.DeleteUser(userId); err != nil {
+	if err := s.DataClient.DeleteUser(ctx, userId); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1207,9 +1324,13 @@ func (s *RestServer) deleteUser(request *restful.Request, response *restful.Resp
 
 // get feedback by user-id with feedback type
 func (s *RestServer) getTypedFeedbackByUser(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	feedbackType := request.PathParameter("feedback-type")
 	userId := request.PathParameter("user-id")
-	feedback, err := s.DataClient.GetUserFeedback(userId, false, feedbackType)
+	feedback, err := s.DataClient.GetUserFeedback(ctx, userId, s.Config.Now(), feedbackType)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1219,8 +1340,12 @@ func (s *RestServer) getTypedFeedbackByUser(request *restful.Request, response *
 
 // get feedback by user-id
 func (s *RestServer) getFeedbackByUser(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	userId := request.PathParameter("user-id")
-	feedback, err := s.DataClient.GetUserFeedback(userId, false)
+	feedback, err := s.DataClient.GetUserFeedback(ctx, userId, s.Config.Now())
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1234,18 +1359,17 @@ type Item struct {
 	IsHidden   bool
 	Categories []string
 	Timestamp  string
-	Labels     []string
+	Labels     any
 	Comment    string
 }
 
-func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
+func (s *RestServer) batchInsertItems(ctx context.Context, response *restful.Response, temp []Item) {
 	var (
-		count        int
-		items        = make([]data.Item, 0, len(temp))
-		popularScore = lo.Map(temp, func(item Item, i int) float64 {
-			return s.PopularItemsCache.GetSortedScore(item.ItemId)
-		})
-		modification = NewCacheModification(s.CacheClient, s.HiddenItemsManager)
+		count int
+		items = make([]data.Item, 0, len(temp))
+		// popularScore = lo.Map(temp, func(item Item, i int) float64 {
+		// 	return s.PopularItemsCache.GetSortedScore(item.ItemId)
+		// })
 
 		loadExistedItemsTime time.Duration
 		parseTimesatmpTime   time.Duration
@@ -1254,7 +1378,7 @@ func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
 	)
 	// load existed items
 	start := time.Now()
-	existedItems, err := s.DataClient.BatchGetItems(lo.Map(temp, func(t Item, i int) string {
+	existedItems, err := s.DataClient.BatchGetItems(ctx, lo.Map(temp, func(t Item, i int) string {
 		return t.ItemId
 	}))
 	if err != nil {
@@ -1268,7 +1392,7 @@ func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
 	loadExistedItemsTime = time.Since(start)
 
 	start = time.Now()
-	for i, item := range temp {
+	for _, item := range temp {
 		// parse datetime
 		var timestamp time.Time
 		var err error
@@ -1286,17 +1410,23 @@ func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
 			Labels:     item.Labels,
 			Comment:    item.Comment,
 		})
-		// collect latest items and poplar items
-		if existedItem, exist := existedItemsSet[item.ItemId]; exist {
-			modification.modifyItem(item.ItemId, existedItem.Categories, item.Categories, float64(items[i].Timestamp.Unix()), popularScore[i])
-		} else {
-			modification.addItem(item.ItemId, item.Categories, float64(timestamp.Unix()), popularScore[i])
+		// insert to latest items cache
+		if err = s.CacheClient.AddScores(ctx, cache.NonPersonalized, cache.Latest, []cache.Score{{
+			Id:         item.ItemId,
+			Score:      float64(timestamp.Unix()),
+			Categories: withWildCard(item.Categories),
+			Timestamp:  time.Now(),
+		}}); err != nil {
+			InternalServerError(response, err)
+			return
 		}
-		// handle hidden items
-		if item.IsHidden {
-			modification.HideItem(item.ItemId)
-		} else {
-			modification.unHideItem(item.ItemId)
+		// update items cache
+		if err = s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, item.ItemId, cache.ScorePatch{
+			Categories: withWildCard(item.Categories),
+			IsHidden:   &item.IsHidden,
+		}); err != nil {
+			InternalServerError(response, err)
+			return
 		}
 		count++
 	}
@@ -1304,7 +1434,7 @@ func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
 
 	// insert items
 	start = time.Now()
-	if err = s.DataClient.BatchInsertItems(items); err != nil {
+	if err = s.DataClient.BatchInsertItems(ctx, items); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1312,26 +1442,22 @@ func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
 
 	// insert modify timestamp
 	start = time.Now()
-	categories := strset.New()
+	categories := mapset.NewSet[string]()
 	values := make([]cache.Value, len(items))
 	for i, item := range items {
 		values[i] = cache.Time(cache.Key(cache.LastModifyItemTime, item.ItemId), time.Now())
-		categories.Add(item.Categories...)
+		categories.Append(item.Categories...)
 	}
-	if err = s.CacheClient.Set(values...); err != nil {
+	if err = s.CacheClient.Set(ctx, values...); err != nil {
 		InternalServerError(response, err)
 		return
 	}
 	// insert categories
-	if err = s.CacheClient.AddSet(cache.ItemCategories, categories.List()...); err != nil {
+	if err = s.CacheClient.AddSet(ctx, cache.ItemCategories, categories.ToSlice()...); err != nil {
 		InternalServerError(response, err)
 		return
 	}
-	// insert timestamp score and popular score
-	if err = modification.Exec(); err != nil {
-		InternalServerError(response, err)
-		return
-	}
+
 	insertCacheTime = time.Since(start)
 	log.ResponseLogger(response).Info("batch insert items",
 		zap.Duration("load_existed_items_time", loadExistedItemsTime),
@@ -1342,66 +1468,89 @@ func (s *RestServer) batchInsertItems(response *restful.Response, temp []Item) {
 }
 
 func (s *RestServer) insertItems(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	var items []Item
 	if err := request.ReadEntity(&items); err != nil {
 		BadRequest(response, err)
 		return
 	}
+	// validate labels
+	for _, user := range items {
+		if err := data.ValidateLabels(user.Labels); err != nil {
+			BadRequest(response, err)
+			return
+		}
+	}
 	// Insert items
-	s.batchInsertItems(response, items)
+	s.batchInsertItems(ctx, response, items)
 }
 
 func (s *RestServer) insertItem(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	var item Item
 	var err error
 	if err = request.ReadEntity(&item); err != nil {
 		BadRequest(response, err)
 		return
 	}
-	s.batchInsertItems(response, []Item{item})
+	// validate labels
+	if err := data.ValidateLabels(item.Labels); err != nil {
+		BadRequest(response, err)
+		return
+	}
+	s.batchInsertItems(ctx, response, []Item{item})
 }
 
 func (s *RestServer) modifyItem(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	itemId := request.PathParameter("item-id")
 	var patch data.ItemPatch
 	if err := request.ReadEntity(&patch); err != nil {
 		BadRequest(response, err)
 		return
 	}
-	// insert hidden items to cache
-	modification := NewCacheModification(s.CacheClient, s.HiddenItemsManager)
-	if patch.IsHidden != nil {
-		if *patch.IsHidden {
-			modification.HideItem(itemId)
-		} else {
-			modification.unHideItem(itemId)
-		}
+	// validate labels
+	if err := data.ValidateLabels(patch.Labels); err != nil {
+		BadRequest(response, err)
+		return
 	}
-	// insert new timestamp to the latest scores
-	if patch.Timestamp != nil || patch.Categories != nil {
-		item, err := s.DataClient.GetItem(itemId)
-		if err != nil {
+	// remove hidden item from cache
+	if patch.IsHidden != nil {
+		if err := s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, itemId, cache.ScorePatch{IsHidden: patch.IsHidden}); err != nil {
 			InternalServerError(response, err)
 			return
 		}
-		popularScore := s.PopularItemsCache.GetSortedScore(itemId)
-		modification.modifyItem(itemId, item.Categories,
-			lo.If(patch.Categories != nil, patch.Categories).Else(item.Categories),
-			float64(lo.If(patch.Timestamp != nil, patch.Timestamp).Else(&item.Timestamp).Unix()),
-			popularScore)
+	}
+	// add item to latest items cache
+	if patch.Timestamp != nil {
+		if err := s.CacheClient.UpdateScores(ctx, []string{cache.NonPersonalized}, proto.String(cache.Latest), itemId, cache.ScorePatch{Score: proto.Float64(float64(patch.Timestamp.Unix()))}); err != nil {
+			InternalServerError(response, err)
+			return
+		}
+	}
+	// update categories in cache
+	if patch.Categories != nil {
+		if err := s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, itemId, cache.ScorePatch{Categories: withWildCard(patch.Categories)}); err != nil {
+			InternalServerError(response, err)
+			return
+		}
 	}
 	// modify item
-	if err := s.DataClient.ModifyItem(itemId, patch); err != nil {
+	if err := s.DataClient.ModifyItem(ctx, itemId, patch); err != nil {
 		InternalServerError(response, err)
 		return
 	}
 	// insert modify timestamp
-	if err := s.CacheClient.Set(cache.Time(cache.Key(cache.LastModifyItemTime, itemId), time.Now())); err != nil {
-		return
-	}
-	// refresh cache
-	if err := modification.Exec(); err != nil {
-		InternalServerError(response, err)
+	if err := s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, itemId), time.Now())); err != nil {
 		return
 	}
 	Ok(response, Success{RowAffected: 1})
@@ -1414,13 +1563,17 @@ type ItemIterator struct {
 }
 
 func (s *RestServer) getItems(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	cursor := request.QueryParameter("cursor")
 	n, err := ParseInt(request, "n", s.Config.Server.DefaultN)
 	if err != nil {
 		BadRequest(response, err)
 		return
 	}
-	cursor, items, err := s.DataClient.GetItems(cursor, n, nil)
+	cursor, items, err := s.DataClient.GetItems(ctx, cursor, n, nil)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1429,10 +1582,14 @@ func (s *RestServer) getItems(request *restful.Request, response *restful.Respon
 }
 
 func (s *RestServer) getItem(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Get item id
 	itemId := request.PathParameter("item-id")
 	// Get item
-	item, err := s.DataClient.GetItem(itemId)
+	item, err := s.DataClient.GetItem(ctx, itemId)
 	if err != nil {
 		if errors.Is(err, errors.NotFound) {
 			PageNotFound(response, err)
@@ -1445,14 +1602,18 @@ func (s *RestServer) getItem(request *restful.Request, response *restful.Respons
 }
 
 func (s *RestServer) deleteItem(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	itemId := request.PathParameter("item-id")
-	// delete item
-	if err := s.DataClient.DeleteItem(itemId); err != nil {
+	// delete item from database
+	if err := s.DataClient.DeleteItem(ctx, itemId); err != nil {
 		InternalServerError(response, err)
 		return
 	}
-	// refresh cache
-	if err := NewCacheModification(s.CacheClient, s.HiddenItemsManager).HideItem(itemId).Exec(); err != nil {
+	// delete item from cache
+	if err := s.CacheClient.DeleteScores(ctx, cache.ItemCache, cache.ScoreCondition{Id: &itemId}); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1460,11 +1621,15 @@ func (s *RestServer) deleteItem(request *restful.Request, response *restful.Resp
 }
 
 func (s *RestServer) insertItemCategory(request *restful.Request, response *restful.Response) {
-	// Get item id and category
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
+	// fetch item id and category
 	itemId := request.PathParameter("item-id")
 	category := request.PathParameter("category")
-	// Insert category
-	item, err := s.DataClient.GetItem(itemId)
+	// fetch item
+	item, err := s.DataClient.GetItem(ctx, itemId)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1472,16 +1637,13 @@ func (s *RestServer) insertItemCategory(request *restful.Request, response *rest
 	if !funk.ContainsString(item.Categories, category) {
 		item.Categories = append(item.Categories, category)
 	}
-	err = s.DataClient.BatchInsertItems([]data.Item{item})
-	if err != nil {
+	// insert category to database
+	if err = s.DataClient.BatchInsertItems(ctx, []data.Item{item}); err != nil {
 		InternalServerError(response, err)
 		return
 	}
-	// refresh cache
-	popularScore := s.PopularItemsCache.GetSortedScore(itemId)
-	modification := NewCacheModification(s.CacheClient, s.HiddenItemsManager)
-	modification.addItemCategory(itemId, category, float64(item.Timestamp.Unix()), popularScore)
-	if err = modification.Exec(); err != nil {
+	// insert category to cache
+	if err = s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, itemId, cache.ScorePatch{Categories: withWildCard(item.Categories)}); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1489,11 +1651,15 @@ func (s *RestServer) insertItemCategory(request *restful.Request, response *rest
 }
 
 func (s *RestServer) deleteItemCategory(request *restful.Request, response *restful.Response) {
-	// Get item id and category
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
+	// fetch item id and category
 	itemId := request.PathParameter("item-id")
 	category := request.PathParameter("category")
-	// Delete category
-	item, err := s.DataClient.GetItem(itemId)
+	// fetch item
+	item, err := s.DataClient.GetItem(ctx, itemId)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1505,13 +1671,13 @@ func (s *RestServer) deleteItemCategory(request *restful.Request, response *rest
 		}
 	}
 	item.Categories = categories
-	err = s.DataClient.BatchInsertItems([]data.Item{item})
-	if err != nil {
+	// delete category from cache
+	if err = s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, itemId, cache.ScorePatch{Categories: withWildCard(categories)}); err != nil {
 		InternalServerError(response, err)
 		return
 	}
-	// refresh cache
-	if err = NewCacheModification(s.CacheClient, s.HiddenItemsManager).deleteItemCategory(itemId, category).Exec(); err != nil {
+	// delete category from database
+	if err = s.DataClient.BatchInsertItems(ctx, []data.Item{item}); err != nil {
 		InternalServerError(response, err)
 		return
 	}
@@ -1541,6 +1707,10 @@ func (f Feedback) ToDataFeedback() (data.Feedback, error) {
 
 func (s *RestServer) insertFeedback(overwrite bool) func(request *restful.Request, response *restful.Response) {
 	return func(request *restful.Request, response *restful.Response) {
+		ctx := context.Background()
+		if request != nil && request.Request != nil {
+			ctx = request.Request.Context()
+		}
 		// add ratings
 		var feedbackLiterTime []Feedback
 		if err := request.ReadEntity(&feedbackLiterTime); err != nil {
@@ -1550,8 +1720,8 @@ func (s *RestServer) insertFeedback(overwrite bool) func(request *restful.Reques
 		// parse datetime
 		var err error
 		feedback := make([]data.Feedback, len(feedbackLiterTime))
-		users := set.NewStringSet()
-		items := set.NewStringSet()
+		users := mapset.NewSet[string]()
+		items := mapset.NewSet[string]()
 		for i := range feedback {
 			users.Add(feedbackLiterTime[i].UserId)
 			items.Add(feedbackLiterTime[i].ItemId)
@@ -1562,26 +1732,21 @@ func (s *RestServer) insertFeedback(overwrite bool) func(request *restful.Reques
 			}
 		}
 		// insert feedback to data store
-		err = s.DataClient.BatchInsertFeedback(feedback,
+		err = s.DataClient.BatchInsertFeedback(ctx, feedback,
 			s.Config.Server.AutoInsertUser,
 			s.Config.Server.AutoInsertItem, overwrite)
 		if err != nil {
 			InternalServerError(response, err)
 			return
 		}
-		// insert feedback to cache store
-		if err = s.InsertFeedbackToCache(feedback); err != nil {
-			InternalServerError(response, err)
-			return
-		}
-		values := make([]cache.Value, 0, users.Size()+items.Size())
-		for _, userId := range users.List() {
+		values := make([]cache.Value, 0, users.Cardinality()+items.Cardinality())
+		for _, userId := range users.ToSlice() {
 			values = append(values, cache.Time(cache.Key(cache.LastModifyUserTime, userId), time.Now()))
 		}
-		for _, itemId := range items.List() {
+		for _, itemId := range items.ToSlice() {
 			values = append(values, cache.Time(cache.Key(cache.LastModifyItemTime, itemId), time.Now()))
 		}
-		if err = s.CacheClient.Set(values...); err != nil {
+		if err = s.CacheClient.Set(ctx, values...); err != nil {
 			InternalServerError(response, err)
 			return
 		}
@@ -1597,6 +1762,10 @@ type FeedbackIterator struct {
 }
 
 func (s *RestServer) getFeedback(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	cursor := request.QueryParameter("cursor")
 	n, err := ParseInt(request, "n", s.Config.Server.DefaultN)
@@ -1604,7 +1773,7 @@ func (s *RestServer) getFeedback(request *restful.Request, response *restful.Res
 		BadRequest(response, err)
 		return
 	}
-	cursor, feedback, err := s.DataClient.GetFeedback(cursor, n, nil)
+	cursor, feedback, err := s.DataClient.GetFeedback(ctx, cursor, n, nil, s.Config.Now())
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1613,6 +1782,10 @@ func (s *RestServer) getFeedback(request *restful.Request, response *restful.Res
 }
 
 func (s *RestServer) getTypedFeedback(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	feedbackType := request.PathParameter("feedback-type")
 	cursor := request.QueryParameter("cursor")
@@ -1621,7 +1794,7 @@ func (s *RestServer) getTypedFeedback(request *restful.Request, response *restfu
 		BadRequest(response, err)
 		return
 	}
-	cursor, feedback, err := s.DataClient.GetFeedback(cursor, n, nil, feedbackType)
+	cursor, feedback, err := s.DataClient.GetFeedback(ctx, cursor, n, nil, s.Config.Now(), feedbackType)
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1630,10 +1803,14 @@ func (s *RestServer) getTypedFeedback(request *restful.Request, response *restfu
 }
 
 func (s *RestServer) getUserItemFeedback(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	userId := request.PathParameter("user-id")
 	itemId := request.PathParameter("item-id")
-	if feedback, err := s.DataClient.GetUserItemFeedback(userId, itemId); err != nil {
+	if feedback, err := s.DataClient.GetUserItemFeedback(ctx, userId, itemId); err != nil {
 		InternalServerError(response, err)
 	} else {
 		Ok(response, feedback)
@@ -1641,10 +1818,14 @@ func (s *RestServer) getUserItemFeedback(request *restful.Request, response *res
 }
 
 func (s *RestServer) deleteUserItemFeedback(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	userId := request.PathParameter("user-id")
 	itemId := request.PathParameter("item-id")
-	if deleteCount, err := s.DataClient.DeleteUserItemFeedback(userId, itemId); err != nil {
+	if deleteCount, err := s.DataClient.DeleteUserItemFeedback(ctx, userId, itemId); err != nil {
 		InternalServerError(response, err)
 	} else {
 		Ok(response, Success{RowAffected: deleteCount})
@@ -1652,11 +1833,15 @@ func (s *RestServer) deleteUserItemFeedback(request *restful.Request, response *
 }
 
 func (s *RestServer) getTypedUserItemFeedback(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	feedbackType := request.PathParameter("feedback-type")
 	userId := request.PathParameter("user-id")
 	itemId := request.PathParameter("item-id")
-	if feedback, err := s.DataClient.GetUserItemFeedback(userId, itemId, feedbackType); err != nil {
+	if feedback, err := s.DataClient.GetUserItemFeedback(ctx, userId, itemId, feedbackType); err != nil {
 		InternalServerError(response, err)
 	} else if feedbackType == "" {
 		Text(response, "{}")
@@ -1666,80 +1851,63 @@ func (s *RestServer) getTypedUserItemFeedback(request *restful.Request, response
 }
 
 func (s *RestServer) deleteTypedUserItemFeedback(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	feedbackType := request.PathParameter("feedback-type")
 	userId := request.PathParameter("user-id")
 	itemId := request.PathParameter("item-id")
-	if deleteCount, err := s.DataClient.DeleteUserItemFeedback(userId, itemId, feedbackType); err != nil {
+	if deleteCount, err := s.DataClient.DeleteUserItemFeedback(ctx, userId, itemId, feedbackType); err != nil {
 		InternalServerError(response, err)
 	} else {
 		Ok(response, Success{deleteCount})
 	}
 }
 
-// Measurement stores a statistical value.
-type Measurement struct {
-	Name      string
-	Timestamp time.Time
-	Value     float32
+type HealthStatus struct {
+	Ready               bool
+	DataStoreError      error
+	CacheStoreError     error
+	DataStoreConnected  bool
+	CacheStoreConnected bool
 }
 
-type innerMeasurement struct {
-	Timestamp time.Time `json:"timestamp"`
-	Value     float32   `json:"value"`
+func (s *RestServer) checkHealth() HealthStatus {
+	healthStatus := HealthStatus{}
+	healthStatus.DataStoreError = s.DataClient.Ping()
+	healthStatus.CacheStoreError = s.CacheClient.Ping()
+	healthStatus.DataStoreConnected = healthStatus.DataStoreError == nil
+	healthStatus.CacheStoreConnected = healthStatus.CacheStoreError == nil
+	healthStatus.Ready = healthStatus.DataStoreConnected && healthStatus.CacheStoreConnected
+	return healthStatus
 }
 
-func NewMeasurementFromScore(name string, score cache.Scored) (Measurement, error) {
-	var m innerMeasurement
-	err := json.Unmarshal([]byte(score.Id), &m)
-	if err != nil {
-		log.Logger().Error("failed to decode measurement", zap.Error(err))
-	}
-	return Measurement{
-		Name:      name,
-		Timestamp: m.Timestamp,
-		Value:     m.Value,
-	}, nil
-}
-
-func (m Measurement) GetScore() cache.Scored {
-	buf, _ := json.Marshal(innerMeasurement{
-		Timestamp: m.Timestamp,
-		Value:     m.Value,
-	})
-	return cache.Scored{Id: string(buf), Score: float64(m.Timestamp.Unix())}
-}
-
-func (s *RestServer) GetMeasurements(name string, n int) ([]Measurement, error) {
-	scores, err := s.CacheClient.GetSorted(cache.Key(cache.Measurements, name), 0, n-1)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	measurements := make([]Measurement, 0, len(scores))
-	for _, score := range scores {
-		measurement, err := NewMeasurementFromScore(name, score)
+func (s *RestServer) checkReady(_ *restful.Request, response *restful.Response) {
+	healthStatus := s.checkHealth()
+	if healthStatus.Ready {
+		Ok(response, healthStatus)
+	} else {
+		errReason, err := json.Marshal(healthStatus)
 		if err != nil {
-			return nil, errors.Trace(err)
+			Error(response, http.StatusInternalServerError, err)
+		} else {
+			Error(response, http.StatusServiceUnavailable, errors.New(string(errReason)))
 		}
-		measurements = append(measurements, measurement)
 	}
-	return measurements, nil
 }
 
-func (s *RestServer) InsertMeasurement(measurements ...Measurement) error {
-	sortedSets := lo.Map(measurements, func(m Measurement, _ int) cache.SortedSet {
-		name := cache.Key(cache.Measurements, m.Name)
-		score := m.GetScore()
-		err := s.CacheClient.RemSortedByScore(name, score.Score, score.Score)
-		if err != nil {
-			log.Logger().Warn("failed to remove stale measurement", zap.Error(err))
-		}
-		return cache.Sorted(name, []cache.Scored{score})
-	})
-	return s.CacheClient.AddSorted(sortedSets...)
+func (s *RestServer) checkLive(_ *restful.Request, response *restful.Response) {
+	healthStatus := s.checkHealth()
+	Ok(response, healthStatus)
 }
 
 func (s *RestServer) getMeasurements(request *restful.Request, response *restful.Response) {
+	ctx := context.Background()
+	if request != nil && request.Request != nil {
+		ctx = request.Request.Context()
+	}
 	// Parse parameters
 	name := request.PathParameter("name")
 	n, err := ParseInt(request, "n", 100)
@@ -1747,7 +1915,7 @@ func (s *RestServer) getMeasurements(request *restful.Request, response *restful
 		BadRequest(response, err)
 		return
 	}
-	measurements, err := s.GetMeasurements(name, n)
+	measurements, err := s.CacheClient.GetTimeSeriesPoints(ctx, name, time.Now().Add(-24*time.Hour*time.Duration(n)), time.Now())
 	if err != nil {
 		InternalServerError(response, err)
 		return
@@ -1789,6 +1957,13 @@ func Ok(response *restful.Response, content interface{}) {
 	}
 }
 
+func Error(response *restful.Response, httpStatus int, responseError error) {
+	response.Header().Set("Access-Control-Allow-Origin", "*")
+	if err := response.WriteError(httpStatus, responseError); err != nil {
+		log.ResponseLogger(response).Error("failed to write error", zap.Error(err))
+	}
+}
+
 // Text returns a plain text.
 func Text(response *restful.Response, content string) {
 	response.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1797,16 +1972,19 @@ func Text(response *restful.Response, content string) {
 	}
 }
 
-// InsertFeedbackToCache inserts feedback to cache.
-func (s *RestServer) InsertFeedbackToCache(feedback []data.Feedback) error {
-	if !s.Config.Recommend.Replacement.EnableReplacement {
-		sortedSets := make([]cache.SortedSet, len(feedback))
-		for i, v := range feedback {
-			sortedSets[i] = cache.Sorted(cache.Key(cache.IgnoreItems, v.UserId), []cache.Scored{{Id: v.ItemId, Score: float64(v.Timestamp.Unix())}})
-		}
-		if err := s.CacheClient.AddSorted(sortedSets...); err != nil {
-			return errors.Trace(err)
-		}
+func withWildCard(categories []string) []string {
+	result := make([]string, len(categories), len(categories)+1)
+	copy(result, categories)
+	result = append(result, "")
+	return result
+}
+
+func ReadCategories(request *restful.Request) []string {
+	if pathValue := request.PathParameter("category"); pathValue != "" {
+		return []string{pathValue}
+	} else if queryValues := request.QueryParameters("category"); len(queryValues) > 0 {
+		return queryValues
+	} else {
+		return []string{""}
 	}
-	return nil
 }

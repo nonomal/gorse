@@ -17,18 +17,18 @@ package ranking
 import (
 	"bufio"
 	"fmt"
+	"os"
+	"reflect"
+	"strings"
+
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/juju/errors"
-	"github.com/scylladb/go-set"
-	"github.com/scylladb/go-set/i32set"
-	"github.com/scylladb/go-set/strset"
+	"github.com/samber/lo"
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/base/encoding"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/model"
 	"go.uber.org/zap"
-	"os"
-	"reflect"
-	"strings"
 )
 
 // DataSet contains preprocessed data structures for recommendation models.
@@ -40,11 +40,11 @@ type DataSet struct {
 	UserFeedback   [][]int32
 	ItemFeedback   [][]int32
 	Negatives      [][]int32
-	ItemLabels     [][]int32
-	UserLabels     [][]int32
+	ItemFeatures   [][]lo.Tuple2[int32, float32]
+	UserFeatures   [][]lo.Tuple2[int32, float32]
 	HiddenItems    []bool
 	ItemCategories [][]string
-	CategorySet    *strset.Set
+	CategorySet    mapset.Set[string]
 	// statistics
 	NumItemLabels    int32
 	NumUserLabels    int32
@@ -55,7 +55,7 @@ type DataSet struct {
 // NewMapIndexDataset creates a data set.
 func NewMapIndexDataset() *DataSet {
 	s := new(DataSet)
-	s.CategorySet = strset.New()
+	s.CategorySet = mapset.NewSet[string]()
 	// Create index
 	s.UserIndex = base.NewMapIndex()
 	s.ItemIndex = base.NewMapIndex()
@@ -90,8 +90,8 @@ func (dataset *DataSet) Bytes() int {
 	bytes += encoding.MatrixBytes(dataset.Negatives)
 
 	// ItemLabels + UserLabels
-	bytes += reflect.TypeOf(dataset.ItemLabels).Elem().Size() * uintptr(len(dataset.ItemLabels)+len(dataset.UserLabels))
-	bytes += reflect.TypeOf(dataset.ItemLabels).Elem().Elem().Size() * uintptr(dataset.NumItemLabelUsed+dataset.NumUserLabelUsed)
+	bytes += reflect.TypeOf(dataset.ItemFeatures).Elem().Size() * uintptr(len(dataset.ItemFeatures)+len(dataset.UserFeatures))
+	bytes += reflect.TypeOf(dataset.ItemFeatures).Elem().Elem().Size() * uintptr(dataset.NumItemLabelUsed+dataset.NumUserLabelUsed)
 
 	bytes += encoding.ArrayBytes(dataset.HiddenItems)
 	bytes += encoding.ArrayBytes(dataset.ItemCategories)
@@ -124,17 +124,21 @@ func (dataset *DataSet) AddFeedback(userId, itemId string, insertUserItem bool) 
 	userIndex := dataset.UserIndex.ToNumber(userId)
 	itemIndex := dataset.ItemIndex.ToNumber(itemId)
 	if userIndex != base.NotId && itemIndex != base.NotId {
-		dataset.FeedbackUsers.Append(userIndex)
-		dataset.FeedbackItems.Append(itemIndex)
-		for int(itemIndex) >= len(dataset.ItemFeedback) {
-			dataset.ItemFeedback = append(dataset.ItemFeedback, make([]int32, 0))
-		}
-		dataset.ItemFeedback[itemIndex] = append(dataset.ItemFeedback[itemIndex], userIndex)
-		for int(userIndex) >= len(dataset.UserFeedback) {
-			dataset.UserFeedback = append(dataset.UserFeedback, make([]int32, 0))
-		}
-		dataset.UserFeedback[userIndex] = append(dataset.UserFeedback[userIndex], itemIndex)
+		dataset.AddRawFeedback(userIndex, itemIndex)
 	}
+}
+
+func (dataset *DataSet) AddRawFeedback(userIndex, itemIndex int32) {
+	dataset.FeedbackUsers.Append(userIndex)
+	dataset.FeedbackItems.Append(itemIndex)
+	for int(itemIndex) >= len(dataset.ItemFeedback) {
+		dataset.ItemFeedback = append(dataset.ItemFeedback, make([]int32, 0))
+	}
+	dataset.ItemFeedback[itemIndex] = append(dataset.ItemFeedback[itemIndex], userIndex)
+	for int(userIndex) >= len(dataset.UserFeedback) {
+		dataset.UserFeedback = append(dataset.UserFeedback, make([]int32, 0))
+	}
+	dataset.UserFeedback[userIndex] = append(dataset.UserFeedback[userIndex], itemIndex)
 }
 
 func (dataset *DataSet) SetNegatives(userId string, negatives []string) {
@@ -183,8 +187,8 @@ func (dataset *DataSet) NegativeSample(excludeSet *DataSet, numCandidates int) [
 		rng := base.NewRandomGenerator(0)
 		dataset.Negatives = make([][]int32, dataset.UserCount())
 		for userIndex := 0; userIndex < dataset.UserCount(); userIndex++ {
-			s1 := set.NewInt32Set(dataset.UserFeedback[userIndex]...)
-			s2 := set.NewInt32Set(excludeSet.UserFeedback[userIndex]...)
+			s1 := mapset.NewSet(dataset.UserFeedback[userIndex]...)
+			s2 := mapset.NewSet(excludeSet.UserFeedback[userIndex]...)
 			dataset.Negatives[userIndex] = rng.SampleInt32(0, int32(dataset.ItemCount()), numCandidates, s1, s2)
 		}
 	}
@@ -201,8 +205,8 @@ func (dataset *DataSet) Split(numTestUsers int, seed int64) (*DataSet, *DataSet)
 	trainSet.HiddenItems, testSet.HiddenItems = dataset.HiddenItems, dataset.HiddenItems
 	trainSet.ItemCategories, testSet.ItemCategories = dataset.ItemCategories, dataset.ItemCategories
 	trainSet.CategorySet, testSet.CategorySet = dataset.CategorySet, dataset.CategorySet
-	trainSet.ItemLabels, testSet.ItemLabels = dataset.ItemLabels, dataset.ItemLabels
-	trainSet.UserLabels, testSet.UserLabels = dataset.UserLabels, dataset.UserLabels
+	trainSet.ItemFeatures, testSet.ItemFeatures = dataset.ItemFeatures, dataset.ItemFeatures
+	trainSet.UserFeatures, testSet.UserFeatures = dataset.UserFeatures, dataset.UserFeatures
 	trainSet.NumItemLabelUsed, testSet.NumItemLabelUsed = dataset.NumItemLabelUsed, dataset.NumItemLabelUsed
 	trainSet.NumUserLabelUsed, testSet.NumUserLabelUsed = dataset.NumUserLabelUsed, dataset.NumUserLabelUsed
 	trainSet.UserIndex, testSet.UserIndex = dataset.UserIndex, dataset.UserIndex
@@ -247,9 +251,9 @@ func (dataset *DataSet) Split(numTestUsers int, seed int64) (*DataSet, *DataSet)
 				}
 			}
 		}
-		testUserSet := i32set.New(testUsers...)
+		testUserSet := mapset.NewSet(testUsers...)
 		for userIndex := int32(0); userIndex < int32(dataset.UserCount()); userIndex++ {
-			if !testUserSet.Has(userIndex) {
+			if !testUserSet.Contains(userIndex) {
 				for _, itemIndex := range dataset.UserFeedback[userIndex] {
 					trainSet.FeedbackUsers.Append(userIndex)
 					trainSet.FeedbackItems.Append(itemIndex)
@@ -265,49 +269,6 @@ func (dataset *DataSet) Split(numTestUsers int, seed int64) (*DataSet, *DataSet)
 // GetIndex gets the i-th record by <user index, item index, rating>.
 func (dataset *DataSet) GetIndex(i int) (int32, int32) {
 	return dataset.FeedbackUsers.Get(i), dataset.FeedbackItems.Get(i)
-}
-
-// LoadDataFromCSV loads Data from a CSV file. The CSV file should be:
-//   [optional header]
-//   <userId 1> <sep> <itemId 1> <sep> <rating 1> <sep> <extras>
-//   <userId 2> <sep> <itemId 2> <sep> <rating 2> <sep> <extras>
-//   <userId 3> <sep> <itemId 3> <sep> <rating 3> <sep> <extras>
-//   ...
-// For example, the `u.Data` from MovieLens 100K is:
-//  196\t242\t3\t881250949
-//  186\t302\t3\t891717742
-//  22\t377\t1\t878887116
-func LoadDataFromCSV(fileName, sep string, hasHeader bool) *DataSet {
-	dataset := NewMapIndexDataset()
-	// Open file
-	file, err := os.Open(fileName)
-	if err != nil {
-		log.Logger().Fatal("failed to open csv file", zap.Error(err),
-			zap.String("csv_file", fileName))
-	}
-	defer func(file *os.File) {
-		err = file.Close()
-		if err != nil {
-			log.Logger().Error("failed to close file", zap.Error(err))
-		}
-	}(file)
-	// Read CSV file
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Ignore header
-		if hasHeader {
-			hasHeader = false
-			continue
-		}
-		fields := strings.Split(line, sep)
-		// Ignore empty line
-		if len(fields) < 2 {
-			continue
-		}
-		dataset.AddFeedback(fields[0], fields[1], true)
-	}
-	return dataset
 }
 
 func loadTest(dataset *DataSet, path string) error {

@@ -22,55 +22,24 @@ import (
 	"github.com/zhenghaoz/gorse/model/click"
 	"github.com/zhenghaoz/gorse/model/ranking"
 	"github.com/zhenghaoz/gorse/protocol"
+	"github.com/zhenghaoz/gorse/storage/meta"
 	"go.uber.org/zap"
-	"google.golang.org/grpc/peer"
 	"io"
-	"strings"
+	"time"
 )
-
-// Node could be worker node for server node.
-type Node struct {
-	Name          string
-	Type          string
-	IP            string
-	HttpPort      int64
-	BinaryVersion string
-}
-
-const (
-	ServerNode = "Server"
-	WorkerNode = "Worker"
-)
-
-// NewNode creates a node from Context and NodeInfo.
-func NewNode(ctx context.Context, nodeInfo *protocol.NodeInfo) *Node {
-	node := new(Node)
-	node.Name = nodeInfo.NodeName
-	node.HttpPort = nodeInfo.HttpPort
-	node.BinaryVersion = nodeInfo.BinaryVersion
-	// read address
-	p, _ := peer.FromContext(ctx)
-	hostAndPort := p.Addr.String()
-	node.IP = strings.Split(hostAndPort, ":")[0]
-	// read type
-	switch nodeInfo.NodeType {
-	case protocol.NodeType_ServerNode:
-		node.Type = ServerNode
-	case protocol.NodeType_WorkerNode:
-		node.Type = WorkerNode
-	}
-	return node
-}
 
 // GetMeta returns latest configuration.
 func (m *Master) GetMeta(ctx context.Context, nodeInfo *protocol.NodeInfo) (*protocol.Meta, error) {
 	// register node
-	node := NewNode(ctx, nodeInfo)
-	if node.Type != "" {
-		if err := m.ttlCache.Set(nodeInfo.NodeName, node); err != nil {
-			log.Logger().Error("failed to set ttl cache", zap.Error(err))
-			return nil, err
-		}
+	node := &meta.Node{
+		UUID:       nodeInfo.Uuid,
+		Hostname:   nodeInfo.Hostname,
+		Type:       nodeInfo.NodeType.String(),
+		Version:    nodeInfo.BinaryVersion,
+		UpdateTime: time.Now().UTC(),
+	}
+	if err := m.metaStore.UpdateNode(node); err != nil {
+		return nil, err
 	}
 	// marshall config
 	s, err := json.Marshal(m.Config)
@@ -94,21 +63,23 @@ func (m *Master) GetMeta(ctx context.Context, nodeInfo *protocol.NodeInfo) (*pro
 	// collect nodes
 	workers := make([]string, 0)
 	servers := make([]string, 0)
-	m.nodesInfoMutex.RLock()
-	for name, info := range m.nodesInfo {
-		switch info.Type {
-		case WorkerNode:
-			workers = append(workers, name)
-		case ServerNode:
-			servers = append(servers, name)
+	nodes, err := m.metaStore.ListNodes()
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range nodes {
+		switch n.Type {
+		case protocol.NodeType_Worker.String():
+			workers = append(workers, n.UUID)
+		case protocol.NodeType_Server.String():
+			servers = append(servers, n.UUID)
 		}
 	}
-	m.nodesInfoMutex.RUnlock()
 	return &protocol.Meta{
 		Config:              string(s),
 		RankingModelVersion: rankingModelVersion,
 		ClickModelVersion:   clickModelVersion,
-		Me:                  nodeInfo.NodeName,
+		Me:                  nodeInfo.Uuid,
 		Workers:             workers,
 		Servers:             servers,
 	}, nil
@@ -208,35 +179,21 @@ func (m *Master) GetClickModel(version *protocol.VersionInfo, sender protocol.Ma
 	return encoderError
 }
 
-// nodeUp handles node information inserted events.
-func (m *Master) nodeUp(key string, value interface{}) {
-	node := value.(*Node)
-	log.Logger().Info("node up",
-		zap.String("node_name", key),
-		zap.String("node_ip", node.IP),
-		zap.String("node_type", node.Type))
-	m.nodesInfoMutex.Lock()
-	defer m.nodesInfoMutex.Unlock()
-	m.nodesInfo[key] = node
-}
-
-// nodeDown handles node information timout events.
-func (m *Master) nodeDown(key string, value interface{}) {
-	node := value.(*Node)
-	log.Logger().Info("node down",
-		zap.String("node_name", key),
-		zap.String("node_ip", node.IP),
-		zap.String("node_type", node.Type))
-	m.nodesInfoMutex.Lock()
-	defer m.nodesInfoMutex.Unlock()
-	delete(m.nodesInfo, key)
-}
-
-func (m *Master) PushTaskInfo(
+func (m *Master) PushProgress(
 	_ context.Context,
-	in *protocol.PushTaskInfoRequest) (*protocol.PushTaskInfoResponse, error) {
-	m.taskMonitor.TaskLock.Lock()
-	defer m.taskMonitor.TaskLock.Unlock()
-	m.taskMonitor.Tasks[in.GetName()] = protocol.DecodeTask(in)
-	return &protocol.PushTaskInfoResponse{}, nil
+	in *protocol.PushProgressRequest) (*protocol.PushProgressResponse, error) {
+	// check empty progress
+	if len(in.Progress) == 0 {
+		return &protocol.PushProgressResponse{}, nil
+	}
+	// check tracers
+	tracer := in.Progress[0].Tracer
+	for _, p := range in.Progress {
+		if p.Tracer != tracer {
+			return nil, errors.Errorf("tracers must be the same, expect %v, got %v", tracer, p.Tracer)
+		}
+	}
+	// store progress
+	m.remoteProgress.Store(tracer, protocol.DecodeProgress(in))
+	return &protocol.PushProgressResponse{}, nil
 }

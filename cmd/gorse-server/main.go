@@ -15,14 +15,15 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
+
 	"github.com/spf13/cobra"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/cmd/version"
+	"github.com/zhenghaoz/gorse/common/util"
 	"github.com/zhenghaoz/gorse/server"
 	"go.uber.org/zap"
-	_ "net/http/pprof"
-	"os"
-	"os/signal"
 )
 
 var serverCommand = &cobra.Command{
@@ -37,17 +38,8 @@ var serverCommand = &cobra.Command{
 		}
 
 		// setup logger
-		var outputPaths []string
-		if cmd.PersistentFlags().Changed("log-path") {
-			outputPath, _ := cmd.PersistentFlags().GetString("log-path")
-			outputPaths = append(outputPaths, outputPath)
-		}
-		debugMode, _ := cmd.PersistentFlags().GetBool("debug")
-		if debugMode {
-			log.SetDevelopmentLogger(outputPaths...)
-		} else {
-			log.SetProductionLogger(outputPaths...)
-		}
+		debug, _ := cmd.PersistentFlags().GetBool("debug")
+		log.SetLogger(cmd.PersistentFlags(), debug)
 
 		// create server
 		masterPort, _ := cmd.PersistentFlags().GetInt("master-port")
@@ -55,7 +47,25 @@ var serverCommand = &cobra.Command{
 		httpPort, _ := cmd.PersistentFlags().GetInt("http-port")
 		httpHost, _ := cmd.PersistentFlags().GetString("http-host")
 		cachePath, _ := cmd.PersistentFlags().GetString("cache-path")
-		s := server.NewServer(masterHost, masterPort, httpHost, httpPort, cachePath)
+		caFile, _ := cmd.PersistentFlags().GetString("ssl-ca")
+		certFile, _ := cmd.PersistentFlags().GetString("ssl-cert")
+		keyFile, _ := cmd.PersistentFlags().GetString("ssl-key")
+		var tlsConfig *util.TLSConfig
+		if caFile != "" && certFile != "" && keyFile != "" {
+			tlsConfig = &util.TLSConfig{
+				SSLCA:   caFile,
+				SSLCert: certFile,
+				SSLKey:  keyFile,
+			}
+		} else if caFile == "" && certFile == "" && keyFile == "" {
+			tlsConfig = nil
+		} else {
+			log.Logger().Fatal("incomplete SSL configuration",
+				zap.String("ssl_ca", caFile),
+				zap.String("ssl_cert", certFile),
+				zap.String("ssl_key", keyFile))
+		}
+		s := server.NewServer(masterHost, masterPort, httpHost, httpPort, cachePath, tlsConfig)
 
 		// stop server
 		done := make(chan struct{})
@@ -75,14 +85,17 @@ var serverCommand = &cobra.Command{
 }
 
 func init() {
+	log.AddFlags(serverCommand.PersistentFlags())
 	serverCommand.PersistentFlags().BoolP("version", "v", false, "gorse version")
 	serverCommand.PersistentFlags().Int("master-port", 8086, "port of master node")
 	serverCommand.PersistentFlags().String("master-host", "127.0.0.1", "host of master node")
 	serverCommand.PersistentFlags().Int("http-port", 8087, "host for RESTful APIs and Prometheus metrics export")
 	serverCommand.PersistentFlags().String("http-host", "127.0.0.1", "port for RESTful APIs and Prometheus metrics export")
 	serverCommand.PersistentFlags().Bool("debug", false, "use debug log mode")
-	serverCommand.PersistentFlags().String("log-path", "", "path of log file")
 	serverCommand.PersistentFlags().String("cache-path", "server_cache.data", "path of cache file")
+	serverCommand.PersistentFlags().String("ssl-ca", "", "path of SSL CA")
+	serverCommand.PersistentFlags().String("ssl-cert", "", "path of SSL certificate")
+	serverCommand.PersistentFlags().String("ssl-key", "", "path of SSL key")
 }
 
 func main() {

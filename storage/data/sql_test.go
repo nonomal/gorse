@@ -17,20 +17,20 @@ package data
 import (
 	"database/sql"
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/zhenghaoz/gorse/storage"
-	"net/url"
 	"os"
-	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+	"github.com/zhenghaoz/gorse/storage"
 )
 
 var (
 	mySqlDSN      string
 	postgresDSN   string
 	clickhouseDSN string
-	oracleDSN     string
 )
 
 func init() {
@@ -44,447 +44,120 @@ func init() {
 	mySqlDSN = env("MYSQL_URI", "mysql://root:password@tcp(127.0.0.1:3306)/")
 	postgresDSN = env("POSTGRES_URI", "postgres://gorse:gorse_pass@127.0.0.1/")
 	clickhouseDSN = env("CLICKHOUSE_URI", "clickhouse://127.0.0.1:8123/")
-	oracleDSN = env("ORACLE_URI", "oracle://system:password@127.0.0.1:1521/XE")
 }
 
-type testSQLDatabase struct {
-	Database
+type MySQLTestSuite struct {
+	baseTestSuite
 }
 
-func (db *testSQLDatabase) Close(t *testing.T) {
-	err := db.Database.Close()
-	assert.NoError(t, err)
-}
-
-func newTestMySQLDatabase(t *testing.T) *testSQLDatabase {
-	// retrieve test name
-	var testName string
-	pc, _, _, ok := runtime.Caller(1)
-	details := runtime.FuncForPC(pc)
-	if ok && details != nil {
-		splits := strings.Split(details.Name(), ".")
-		testName = splits[len(splits)-1]
-	} else {
-		t.Fatalf("failed to retrieve test name")
-	}
-
-	database := new(testSQLDatabase)
-	var err error
+func (suite *MySQLTestSuite) SetupSuite() {
 	// create database
 	databaseComm, err := sql.Open("mysql", mySqlDSN[len(storage.MySQLPrefix):])
-	assert.NoError(t, err)
-	dbName := "gorse_" + testName
+	suite.NoError(err)
+	const dbName = "gorse_data_test"
 	_, err = databaseComm.Exec("DROP DATABASE IF EXISTS " + dbName)
-	assert.NoError(t, err)
+	suite.NoError(err)
 	_, err = databaseComm.Exec("CREATE DATABASE " + dbName)
-	assert.NoError(t, err)
+	suite.NoError(err)
 	err = databaseComm.Close()
-	assert.NoError(t, err)
+	suite.NoError(err)
 	// connect database
-	database.Database, err = Open(mySqlDSN+dbName, "gorse_")
-	assert.NoError(t, err)
+	suite.Database, err = Open(mySqlDSN+dbName, "gorse_")
+	suite.NoError(err)
 	// create schema
-	err = database.Init()
-	assert.NoError(t, err)
-	return database
+	err = suite.Database.Init()
+	suite.NoError(err)
 }
 
-func TestMySQL_Users(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testUsers(t, db.Database)
-}
-
-func TestMySQL_Feedback(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testFeedback(t, db.Database)
-}
-
-func TestMySQL_Item(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testItems(t, db.Database)
-}
-
-func TestMySQL_DeleteUser(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testDeleteUser(t, db.Database)
-}
-
-func TestMySQL_DeleteItem(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testDeleteItem(t, db.Database)
-}
-
-func TestMySQL_DeleteFeedback(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testDeleteFeedback(t, db.Database)
-}
-
-func TestMySQL_TimeLimit(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testTimeLimit(t, db.Database)
-}
-
-func TestMySQL_Timezone(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	testTimeZone(t, db.Database)
-}
-
-func TestMySQL_Init(t *testing.T) {
-	db := newTestMySQLDatabase(t)
-	defer db.Close(t)
-	assert.NoError(t, db.Init())
-
+func (suite *MySQLTestSuite) TestInit() {
 	name, err := storage.ProbeMySQLIsolationVariableName(mySqlDSN[len(storage.MySQLPrefix):])
-	assert.NoError(t, err)
-	connection := db.Database.(*SQLDatabase).client
-	assertQuery(t, connection, fmt.Sprintf("SELECT @@%s", name), "READ-UNCOMMITTED")
-	assertQuery(t, connection, "SELECT @@sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION")
+	suite.NoError(err)
+	connection := suite.Database.(*SQLDatabase).client
+	assertQuery(suite.T(), connection, fmt.Sprintf("SELECT @@%s", name), "READ-UNCOMMITTED")
+	assertQuery(suite.T(), connection, "SELECT @@sql_mode", "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION")
 }
 
-func newTestPostgresDatabase(t *testing.T) *testSQLDatabase {
-	// retrieve test name
-	var testName string
-	pc, _, _, ok := runtime.Caller(1)
-	details := runtime.FuncForPC(pc)
-	if ok && details != nil {
-		splits := strings.Split(details.Name(), ".")
-		testName = splits[len(splits)-1]
-	} else {
-		t.Fatalf("failed to retrieve test name")
-	}
+func TestMySQL(t *testing.T) {
+	suite.Run(t, new(MySQLTestSuite))
+}
 
-	database := new(testSQLDatabase)
+type PostgresTestSuite struct {
+	baseTestSuite
+}
+
+func (suite *PostgresTestSuite) SetupSuite() {
 	var err error
 	// create database
 	databaseComm, err := sql.Open("postgres", postgresDSN+"?sslmode=disable")
-	assert.NoError(t, err)
-	dbName := "gorse_" + testName
+	suite.NoError(err)
+	const dbName = "gorse_data_test"
 	_, err = databaseComm.Exec("DROP DATABASE IF EXISTS " + dbName)
-	assert.NoError(t, err)
+	suite.NoError(err)
 	_, err = databaseComm.Exec("CREATE DATABASE " + dbName)
-	assert.NoError(t, err)
+	suite.NoError(err)
 	err = databaseComm.Close()
-	assert.NoError(t, err)
+	suite.NoError(err)
 	// connect database
-	database.Database, err = Open(postgresDSN+strings.ToLower(dbName)+"?sslmode=disable", "gorse_")
-	assert.NoError(t, err)
+	suite.Database, err = Open(postgresDSN+strings.ToLower(dbName)+"?sslmode=disable", "gorse_")
+	suite.NoError(err)
 	// create schema
-	err = database.Init()
-	assert.NoError(t, err)
-	return database
+	err = suite.Database.Init()
+	suite.NoError(err)
 }
 
-func TestPostgres_Users(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testUsers(t, db.Database)
+func TestPostgres(t *testing.T) {
+	suite.Run(t, new(PostgresTestSuite))
 }
 
-func TestPostgres_Feedback(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testFeedback(t, db.Database)
+type ClickHouseTestSuite struct {
+	baseTestSuite
 }
 
-func TestPostgres_Item(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testItems(t, db.Database)
-}
-
-func TestPostgres_DeleteUser(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testDeleteUser(t, db.Database)
-}
-
-func TestPostgres_DeleteItem(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testDeleteItem(t, db.Database)
-}
-
-func TestPostgres_DeleteFeedback(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testDeleteFeedback(t, db.Database)
-}
-
-func TestPostgres_TimeLimit(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testTimeLimit(t, db.Database)
-}
-
-func TestPostgres_Timezone(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	testTimeZone(t, db.Database)
-}
-
-func TestPostgres_Init(t *testing.T) {
-	db := newTestPostgresDatabase(t)
-	defer db.Close(t)
-	assert.NoError(t, db.Init())
-}
-
-func newTestClickHouseDatabase(t *testing.T) *testSQLDatabase {
-	// retrieve test name
-	var testName string
-	pc, _, _, ok := runtime.Caller(1)
-	details := runtime.FuncForPC(pc)
-	if ok && details != nil {
-		splits := strings.Split(details.Name(), ".")
-		testName = splits[len(splits)-1]
-	} else {
-		t.Fatalf("failed to retrieve test name")
-	}
-
-	database := new(testSQLDatabase)
+func (suite *ClickHouseTestSuite) SetupSuite() {
 	var err error
 	// create database
 	databaseComm, err := sql.Open("chhttp", "http://"+clickhouseDSN[len(storage.ClickhousePrefix):])
-	assert.NoError(t, err)
-	dbName := "gorse_" + testName
+	suite.NoError(err)
+	const dbName = "gorse_data_test"
 	_, err = databaseComm.Exec("DROP DATABASE IF EXISTS " + dbName)
-	assert.NoError(t, err)
+	suite.NoError(err)
 	_, err = databaseComm.Exec("CREATE DATABASE " + dbName)
-	assert.NoError(t, err)
+	suite.NoError(err)
 	err = databaseComm.Close()
-	assert.NoError(t, err)
+	suite.NoError(err)
 	// connect database
-	database.Database, err = Open(clickhouseDSN+dbName+"?mutations_sync=2", "gorse_")
-	assert.NoError(t, err)
+	suite.Database, err = Open(clickhouseDSN+dbName+"?mutations_sync=2", "gorse_")
+	suite.NoError(err)
 	// create schema
-	err = database.Init()
-	assert.NoError(t, err)
-	return database
+	err = suite.Database.Init()
+	suite.NoError(err)
 }
 
-func TestClickHouse_Users(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testUsers(t, db.Database)
+func TestClickHouse(t *testing.T) {
+	suite.Run(t, new(ClickHouseTestSuite))
 }
 
-func TestClickHouse_Feedback(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testFeedback(t, db.Database)
+type SQLiteTestSuite struct {
+	baseTestSuite
 }
 
-func TestClickHouse_Item(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testItems(t, db.Database)
-}
-
-func TestClickHouse_DeleteUser(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testDeleteUser(t, db.Database)
-}
-
-func TestClickHouse_DeleteItem(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testDeleteItem(t, db.Database)
-}
-
-func TestClickHouse_DeleteFeedback(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testDeleteFeedback(t, db.Database)
-}
-
-func TestClickHouse_TimeLimit(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testTimeLimit(t, db.Database)
-}
-
-func TestClickHouse_Timezone(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	testTimeZone(t, db.Database)
-}
-
-func TestClickHouse_Init(t *testing.T) {
-	db := newTestClickHouseDatabase(t)
-	defer db.Close(t)
-	assert.NoError(t, db.Init())
-}
-
-func newTestOracleDatabase(t *testing.T) *testSQLDatabase {
-	// retrieve test name
-	var testName string
-	pc, _, _, ok := runtime.Caller(1)
-	details := runtime.FuncForPC(pc)
-	if ok && details != nil {
-		splits := strings.Split(details.Name(), ".")
-		testName = splits[len(splits)-1]
-	} else {
-		t.Fatalf("failed to retrieve test name")
-	}
-
-	database := new(testSQLDatabase)
+func (suite *SQLiteTestSuite) SetupSuite() {
 	var err error
 	// create database
-	databaseComm, err := sql.Open("oracle", oracleDSN)
-	assert.NoError(t, err)
-	dbName := strings.ToUpper(testName)
-	rows, err := databaseComm.Query("select * from dba_users where username=:1", dbName)
-	assert.NoError(t, err)
-	if rows.Next() {
-		// drop user if exists
-		_, err = databaseComm.Exec(fmt.Sprintf("DROP USER %s CASCADE", dbName))
-		assert.NoError(t, err)
-	}
-	err = rows.Close()
-	assert.NoError(t, err)
-	_, err = databaseComm.Exec(fmt.Sprintf("CREATE USER %s IDENTIFIED BY %s", dbName, dbName))
-	assert.NoError(t, err)
-	_, err = databaseComm.Exec(fmt.Sprintf("GRANT ALL PRIVILEGES TO %s", dbName))
-	assert.NoError(t, err)
-	err = databaseComm.Close()
-	assert.NoError(t, err)
-	// connect database
-	parsed, err := url.Parse(oracleDSN)
-	assert.NoError(t, err)
-	database.Database, err = Open(fmt.Sprintf("oracle://%s:%s@%s/%s", dbName, dbName, parsed.Host, parsed.Path), "gorse_")
-	assert.NoError(t, err)
+	path := fmt.Sprintf("sqlite://%s/sqlite.db", suite.T().TempDir())
+	suite.Database, err = Open(path, "gorse_")
+	suite.NoError(err)
 	// create schema
-	err = database.Init()
-	assert.NoError(t, err)
-	return database
+	err = suite.Database.Init()
+	suite.NoError(err)
 }
 
-func TestOracle_Users(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testUsers(t, db.Database)
+func (suite *SQLiteTestSuite) TearDownSuite() {
+	suite.NoError(suite.Database.Close())
 }
 
-func TestOracle_Feedback(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testFeedback(t, db.Database)
-}
-
-func TestOracle_Item(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testItems(t, db.Database)
-}
-
-func TestOracle_DeleteUser(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testDeleteUser(t, db.Database)
-}
-
-func TestOracle_DeleteItem(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testDeleteItem(t, db.Database)
-}
-
-func TestOracle_DeleteFeedback(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testDeleteFeedback(t, db.Database)
-}
-
-func TestOracle_TimeLimit(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testTimeLimit(t, db.Database)
-}
-
-func TestOracle_Timezone(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	testTimeZone(t, db.Database)
-}
-
-func TestOracle_Init(t *testing.T) {
-	db := newTestOracleDatabase(t)
-	defer db.Close(t)
-	assert.NoError(t, db.Init())
-}
-
-func newTestSQLiteDatabase(t *testing.T) *testSQLDatabase {
-	database := new(testSQLDatabase)
-	var err error
-	// create database
-	database.Database, err = Open("sqlite://:memory:", "gorse_")
-	assert.NoError(t, err)
-	// create schema
-	err = database.Init()
-	assert.NoError(t, err)
-	return database
-}
-
-func TestSQLite_Users(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testUsers(t, db.Database)
-}
-
-func TestSQLite_Feedback(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testFeedback(t, db.Database)
-}
-
-func TestSQLite_Item(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testItems(t, db.Database)
-}
-
-func TestSQLite_DeleteUser(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testDeleteUser(t, db.Database)
-}
-
-func TestSQLite_DeleteItem(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testDeleteItem(t, db.Database)
-}
-
-func TestSQLite_DeleteFeedback(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testDeleteFeedback(t, db.Database)
-}
-
-func TestSQLite_TimeLimit(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testTimeLimit(t, db.Database)
-}
-
-func TestSQLite_Timezone(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	testTimeZone(t, db.Database)
-}
-
-func TestSQLite_Init(t *testing.T) {
-	db := newTestSQLiteDatabase(t)
-	defer db.Close(t)
-	assert.NoError(t, db.Init())
+func TestSQLite(t *testing.T) {
+	suite.Run(t, new(SQLiteTestSuite))
 }
 
 func assertQuery(t *testing.T, connection *sql.DB, sql string, expected string) {
@@ -495,4 +168,73 @@ func assertQuery(t *testing.T, connection *sql.DB, sql string, expected string) 
 	err = rows.Scan(&result)
 	assert.NoError(t, err)
 	assert.Equal(t, expected, result)
+}
+
+func BenchmarkMySQL_CountItems(b *testing.B) {
+	// create database
+	database, err := Open(mySqlDSN, "gorse_")
+	require.NoError(b, err)
+	dbName := "gorse_data_test"
+	databaseComm := database.(*SQLDatabase)
+	_, err = databaseComm.client.Exec("DROP DATABASE IF EXISTS " + dbName)
+	require.NoError(b, err)
+	_, err = databaseComm.client.Exec("CREATE DATABASE " + dbName)
+	require.NoError(b, err)
+	database, err = Open(mySqlDSN+dbName, "gorse_")
+	require.NoError(b, err)
+	err = database.Init()
+	require.NoError(b, err)
+	// benchmark
+	benchmarkCountItems(b, database)
+	// close database
+	err = database.Close()
+	require.NoError(b, err)
+}
+
+func BenchmarkPostgres_CountItems(b *testing.B) {
+	// create database
+	database, err := Open(postgresDSN+"gorse_data_test?sslmode=disable", "gorse_")
+	require.NoError(b, err)
+	err = database.Init()
+	require.NoError(b, err)
+	// benchmark
+	benchmarkCountItems(b, database)
+	// close database
+	err = database.Close()
+	require.NoError(b, err)
+}
+
+func BenchmarkClickHouse_CountItems(b *testing.B) {
+	// create database
+	databaseComm, err := sql.Open("chhttp", "http://"+clickhouseDSN[len(storage.ClickhousePrefix):])
+	require.NoError(b, err)
+	const dbName = "gorse_data_test"
+	_, err = databaseComm.Exec("DROP DATABASE IF EXISTS " + dbName)
+	require.NoError(b, err)
+	_, err = databaseComm.Exec("CREATE DATABASE " + dbName)
+	require.NoError(b, err)
+	err = databaseComm.Close()
+	require.NoError(b, err)
+	database, err := Open(clickhouseDSN+"gorse_data_test?mutations_sync=2", "gorse_")
+	require.NoError(b, err)
+	err = database.Init()
+	require.NoError(b, err)
+	// benchmark
+	benchmarkCountItems(b, database)
+	// close database
+	err = database.Close()
+	require.NoError(b, err)
+}
+
+func BenchmarkSQLite_CountItems(b *testing.B) {
+	// create database
+	database, err := Open("sqlite://"+os.TempDir()+"/sqlite.db", "gorse_")
+	require.NoError(b, err)
+	err = database.Init()
+	require.NoError(b, err)
+	// benchmark
+	benchmarkCountItems(b, database)
+	// close database
+	err = database.Close()
+	require.NoError(b, err)
 }

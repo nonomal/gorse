@@ -15,8 +15,13 @@
 package click
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"reflect"
+	"time"
+
 	"github.com/chewxy/math32"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
@@ -27,12 +32,10 @@ import (
 	"github.com/zhenghaoz/gorse/base/floats"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/base/parallel"
+	"github.com/zhenghaoz/gorse/base/progress"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/model"
 	"go.uber.org/zap"
-	"io"
-	"reflect"
-	"time"
 )
 
 type Score struct {
@@ -91,14 +94,12 @@ func (score Score) BetterThan(s Score) bool {
 }
 
 type FitConfig struct {
-	Jobs    int
+	*task.JobsAllocator
 	Verbose int
-	Task    *task.Task
 }
 
 func NewFitConfig() *FitConfig {
 	return &FitConfig{
-		Jobs:    1,
 		Verbose: 10,
 	}
 }
@@ -108,13 +109,8 @@ func (config *FitConfig) SetVerbose(verbose int) *FitConfig {
 	return config
 }
 
-func (config *FitConfig) SetJobs(nJobs int) *FitConfig {
-	config.Jobs = nJobs
-	return config
-}
-
-func (config *FitConfig) SetTask(t *task.Task) *FitConfig {
-	config.Task = t
+func (config *FitConfig) SetJobsAllocator(allocator *task.JobsAllocator) *FitConfig {
+	config.JobsAllocator = allocator
 	return config
 }
 
@@ -127,12 +123,23 @@ func (config *FitConfig) LoadDefaultIfNil() *FitConfig {
 
 type FactorizationMachine interface {
 	model.Model
-	Predict(userId, itemId string, userLabels, itemLabels []string) float32
+	Predict(userId, itemId string, userFeatures, itemFeatures []Feature) float32
 	InternalPredict(x []int32, values []float32) float32
-	Fit(trainSet *Dataset, testSet *Dataset, config *FitConfig) Score
+	Fit(ctx context.Context, trainSet *Dataset, testSet *Dataset, config *FitConfig) Score
 	Marshal(w io.Writer) error
-	Bytes() int
-	Complexity() int
+}
+
+type BatchInference interface {
+	BatchPredict(inputs []lo.Tuple4[string, string, []Feature, []Feature]) []float32
+	BatchInternalPredict(x []lo.Tuple2[[]int32, []float32]) []float32
+}
+
+type FactorizationMachineCloner interface {
+	Clone() FactorizationMachine
+}
+
+type FactorizationMachineSpawner interface {
+	Spawn() FactorizationMachine
 }
 
 type BaseFactorizationMachine struct {
@@ -167,6 +174,7 @@ type FM struct {
 	reg        float32
 	initMean   float32
 	initStdDev float32
+	optimizer  string
 }
 
 func (fm *FM) GetParamsGrid(withSize bool) model.ParamsGrid {
@@ -195,9 +203,10 @@ func (fm *FM) SetParams(params model.Params) {
 	fm.reg = fm.Params.GetFloat32(model.Reg, 0.0)
 	fm.initMean = fm.Params.GetFloat32(model.InitMean, 0)
 	fm.initStdDev = fm.Params.GetFloat32(model.InitStdDev, 0.01)
+	fm.optimizer = fm.Params.GetString(model.Optimizer, model.Adam)
 }
 
-func (fm *FM) Predict(userId, itemId string, userLabels, itemLabels []string) float32 {
+func (fm *FM) Predict(userId, itemId string, userFeatures, itemFeatures []Feature) float32 {
 	var features []int32
 	var values []float32
 	// encode user
@@ -210,20 +219,18 @@ func (fm *FM) Predict(userId, itemId string, userLabels, itemLabels []string) fl
 		features = append(features, itemIndex)
 		values = append(values, 1)
 	}
-	// normalization
-	norm := math32.Sqrt(float32(len(userLabels) + len(itemLabels)))
 	// encode user labels
-	for _, userLabel := range userLabels {
-		if userLabelIndex := fm.Index.EncodeUserLabel(userLabel); userLabelIndex != base.NotId {
-			features = append(features, userLabelIndex)
-			values = append(values, 1/norm)
+	for _, userFeature := range userFeatures {
+		if userFeatureIndex := fm.Index.EncodeUserLabel(userFeature.Name); userFeatureIndex != base.NotId {
+			features = append(features, userFeatureIndex)
+			values = append(values, userFeature.Value)
 		}
 	}
 	// encode item labels
-	for _, itemLabel := range itemLabels {
-		if itemLabelIndex := fm.Index.EncodeItemLabel(itemLabel); itemLabelIndex != base.NotId {
-			features = append(features, itemLabelIndex)
-			values = append(values, 1/norm)
+	for _, itemFeature := range itemFeatures {
+		if itemFeatureIndex := fm.Index.EncodeItemLabel(itemFeature.Name); itemFeatureIndex != base.NotId {
+			features = append(features, itemFeatureIndex)
+			values = append(values, itemFeature.Value)
 		}
 	}
 	return fm.InternalPredict(features, values)
@@ -267,7 +274,7 @@ func (fm *FM) InternalPredict(features []int32, values []float32) float32 {
 }
 
 // Fit trains the model. Its task complexity is O(fm.nEpochs).
-func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
+func (fm *FM) Fit(ctx context.Context, trainSet, testSet *Dataset, config *FitConfig) Score {
 	config = config.LoadDefaultIfNil()
 	log.Logger().Info("fit FM",
 		zap.Int("train_size", trainSet.Count()),
@@ -280,8 +287,18 @@ func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
 		zap.Any("params", fm.GetParams()),
 		zap.Any("config", config))
 	fm.Init(trainSet)
-	temp := base.NewMatrix32(config.Jobs, fm.nFactors)
-	vGrad := base.NewMatrix32(config.Jobs, fm.nFactors)
+	maxJobs := config.MaxJobs()
+	temp := base.NewMatrix32(maxJobs, fm.nFactors)
+	vGrad := base.NewMatrix32(maxJobs, fm.nFactors)
+	vGrad2 := base.NewMatrix32(maxJobs, fm.nFactors)
+	mV := base.NewTensor32(maxJobs, int(trainSet.Index.Len()), fm.nFactors)
+	mW := base.NewMatrix32(maxJobs, int(trainSet.Index.Len()))
+	mB := make([]float32, maxJobs)
+	vV := base.NewTensor32(maxJobs, int(trainSet.Index.Len()), fm.nFactors)
+	vW := base.NewMatrix32(maxJobs, int(trainSet.Index.Len()))
+	vB := make([]float32, maxJobs)
+	mVHat := base.NewMatrix32(maxJobs, fm.nFactors)
+	vVHat := base.NewMatrix32(maxJobs, fm.nFactors)
 
 	snapshots := SnapshotManger{}
 	evalStart := time.Now()
@@ -299,6 +316,7 @@ func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
 	log.Logger().Debug(fmt.Sprintf("fit fm %v/%v", 0, fm.nEpochs), fields...)
 	snapshots.AddSnapshot(score, fm.V, fm.W, fm.B)
 
+	_, span := progress.Start(ctx, "FM.Fit", fm.nEpochs)
 	for epoch := 1; epoch <= fm.nEpochs; epoch++ {
 		for i := 0; i < trainSet.Target.Len(); i++ {
 			fm.MinTarget = math32.Min(fm.MinTarget, trainSet.Target.Get(i))
@@ -306,7 +324,7 @@ func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
 		}
 		fitStart := time.Now()
 		cost := float32(0)
-		_ = parallel.BatchParallel(trainSet.Count(), config.Jobs, 128, func(workerId, beginJobId, endJobId int) error {
+		_ = parallel.BatchParallel(trainSet.Count(), config.AvailableJobs(), 128, func(workerId, beginJobId, endJobId int) error {
 			for i := beginJobId; i < endJobId; i++ {
 				features, values, target := trainSet.Get(i)
 				prediction := fm.internalPredictImpl(features, values)
@@ -317,8 +335,8 @@ func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
 					cost += grad * grad / 2
 				case FMClassification:
 					grad = -target * (1 - 1/(1+math32.Exp(-target*prediction)))
-					cost += (1 + target) * math32.Log(1+math32.Exp(-prediction)) / 2
-					cost += (1 - target) * math32.Log(1+math32.Exp(prediction)) / 2
+					cost += (1 + target) * math32.Log1p(exp(-prediction)) / 2
+					cost += (1 - target) * math32.Log1p(exp(prediction)) / 2
 				default:
 					log.Logger().Fatal("unknown task", zap.String("task", string(fm.Task)))
 				}
@@ -327,17 +345,77 @@ func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
 				for it, j := range features {
 					floats.MulConstAddTo(fm.V[j], values[it], temp[workerId])
 				}
+
+				correct1 := 1 / (1 - math32.Pow(beta1, float32(epoch)))
+				correct2 := 1 / (1 - math32.Pow(beta2, float32(epoch)))
+
 				// Update w_0
-				fm.B -= fm.lr * grad
+				switch fm.optimizer {
+				case model.SGD:
+					fm.B -= fm.lr * grad
+				case model.Adam:
+					// m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t
+					mB[workerId] = beta1*mB[workerId] + (1-beta1)*grad
+					// v_t = \beta_2 v_{t-1} + (1 - \beta_2) g^2_t
+					vB[workerId] = beta2*vB[workerId] + (1-beta2)*grad*grad
+					// \hat{m}_t = m_t / (1 - \beta^t_1)
+					mBHat := mB[workerId] * correct1
+					// \hat{v}_t = v_t / (1 - \beta^t_2)
+					vBHat := vB[workerId] * correct2
+					// w_0 = w_0 - \eta \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)
+					fm.B -= fm.lr * mBHat / (math32.Sqrt(vBHat) + eps)
+				default:
+					log.Logger().Fatal("unknown optimizer", zap.String("optimizer", fm.optimizer))
+				}
+
 				for it, i := range features {
 					// Update w_i
-					fm.W[i] -= fm.lr * grad * values[it]
+					switch fm.optimizer {
+					case model.SGD:
+						fm.W[i] -= fm.lr * grad
+					case model.Adam:
+						// m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t
+						mW[workerId][i] = beta1*mW[workerId][i] + (1-beta1)*grad
+						// v_t = \beta_2 v_{t-1} + (1 - \beta_2) g^2_t
+						vW[workerId][i] = beta2*vW[workerId][i] + (1-beta2)*grad*grad
+						// \hat{m}_t = m_t / (1 - \beta^t_1)
+						mWHat := mW[workerId][i] * correct1
+						// \hat{v}_t = v_t / (1 - \beta^t_2)
+						vWHat := vW[workerId][i] * correct2
+						// w_i = w_i - \eta \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)
+						fm.W[i] -= fm.lr * mWHat / (math32.Sqrt(vWHat) + eps)
+					default:
+						log.Logger().Fatal("unknown optimizer", zap.String("optimizer", fm.optimizer))
+					}
+
 					// Update v_{i,f}
 					floats.MulConstTo(temp[workerId], values[it], vGrad[workerId])
 					floats.MulConstAddTo(fm.V[i], -values[it]*values[it], vGrad[workerId])
 					floats.MulConst(vGrad[workerId], grad)
 					floats.MulConstAddTo(fm.V[i], fm.reg, vGrad[workerId])
-					floats.MulConstAddTo(vGrad[workerId], -fm.lr, fm.V[i])
+					switch fm.optimizer {
+					case model.SGD:
+						floats.MulConstAddTo(vGrad[workerId], -fm.lr, fm.V[i])
+					case model.Adam:
+						// m_t = \beta_1 m_{t-1} + (1 - \beta_1) g_t
+						floats.MulConst(mV[workerId][i], beta1)
+						floats.MulConstAddTo(vGrad[workerId], 1-beta1, mV[workerId][i])
+						// v_t = \beta_2 v_{t-1} + (1 - \beta_2) g^2_t
+						floats.MulConst(vV[workerId][i], beta2)
+						floats.MulTo(vGrad[workerId], vGrad[workerId], vGrad2[workerId])
+						floats.MulConstAddTo(vGrad2[workerId], 1-beta2, vV[workerId][i])
+						// \hat{m}_t = m_t / (1 - \beta^t_1)
+						floats.MulConstTo(mV[workerId][i], correct1, mVHat[workerId])
+						// \hat{v}_t = v_t / (1 - \beta^t_2)
+						floats.MulConstTo(vV[workerId][i], correct2, vVHat[workerId])
+						// v_{i,f} = v_{i,f} - \eta \hat{m}_t / (\sqrt{\hat{v}_t} + \epsilon)
+						floats.Sqrt(vVHat[workerId])
+						floats.AddConst(vVHat[workerId], eps)
+						floats.Div(mVHat[workerId], vVHat[workerId])
+						floats.MulConstAddTo(mVHat[workerId], -fm.lr, fm.V[i])
+					default:
+						log.Logger().Fatal("unknown optimizer", zap.String("optimizer", fm.optimizer))
+					}
 				}
 			}
 			return nil
@@ -364,12 +442,14 @@ func (fm *FM) Fit(trainSet, testSet *Dataset, config *FitConfig) Score {
 			// check NaN
 			if math32.IsNaN(cost) || math32.IsNaN(score.GetValue()) {
 				log.Logger().Warn("model diverged", zap.Float32("lr", fm.lr))
+				span.Fail(errors.New("model diverged"))
 				break
 			}
 			snapshots.AddSnapshot(score, fm.V, fm.W, fm.B)
 		}
-		config.Task.Add(1)
+		span.Add(1)
 	}
+	span.End()
 	// restore best snapshot
 	fm.V = snapshots.BestWeights[0].([][]float32)
 	fm.W = snapshots.BestWeights[1].([]float32)
@@ -450,39 +530,56 @@ func (fm *FM) Init(trainSet *Dataset) {
 	fm.BaseFactorizationMachine.Init(trainSet)
 }
 
-func (fm *FM) Bytes() int {
-	// The memory usage of FM consists of:
-	// 1. struct
-	// 2. float32 in fm.W
-	// 3. slice in fm.V
-	// 4. UnifiedIndex
-	bytes := reflect.TypeOf(fm).Elem().Size()
-	bytes += reflect.TypeOf(fm.W).Elem().Size() * uintptr(len(fm.W))
-	if len(fm.V) > 0 {
-		bytes += reflect.TypeOf(fm.V).Elem().Size() * uintptr(len(fm.V))
-		bytes += reflect.TypeOf(fm.V).Elem().Elem().Size() * uintptr(len(fm.V)) * uintptr(fm.nFactors)
-	}
-	return int(bytes) + fm.Index.Bytes()
-}
-
-func (fm *FM) Complexity() int {
-	return fm.nEpochs
-}
-
 func MarshalModel(w io.Writer, m FactorizationMachine) error {
+	// write header
+	var err error
+	switch m.(type) {
+	case *FM:
+		err = encoding.WriteString(w, headerFM)
+	case *DeepFM:
+		err = encoding.WriteString(w, headerDeepFM)
+	default:
+		return fmt.Errorf("unknown model: %v", reflect.TypeOf(m))
+	}
+	if err != nil {
+		return err
+	}
 	return m.Marshal(w)
 }
 
+const (
+	headerFM     = "FM"
+	headerDeepFM = "DeepFM"
+)
+
 func UnmarshalModel(r io.Reader) (FactorizationMachine, error) {
-	var fm FM
-	if err := fm.Unmarshal(r); err != nil {
+	// read header
+	header, err := encoding.ReadString(r)
+	if err != nil {
 		return nil, err
 	}
-	return &fm, nil
+	switch header {
+	case headerFM:
+		var fm FM
+		if err := fm.Unmarshal(r); err != nil {
+			return nil, errors.Trace(err)
+		}
+		return &fm, nil
+	case headerDeepFM:
+		fm := NewDeepFM(nil)
+		if err := fm.Unmarshal(r); err != nil {
+			return nil, errors.Trace(err)
+		}
+		return fm, nil
+	}
+	return nil, fmt.Errorf("unknown model: %v", header)
 }
 
 // Clone a model with deep copy.
 func Clone(m FactorizationMachine) FactorizationMachine {
+	if cloner, ok := m.(FactorizationMachineCloner); ok {
+		return cloner.Clone()
+	}
 	var copied FactorizationMachine
 	if err := copier.Copy(&copied, m); err != nil {
 		panic(err)
@@ -490,6 +587,13 @@ func Clone(m FactorizationMachine) FactorizationMachine {
 		copied.SetParams(copied.GetParams())
 		return copied
 	}
+}
+
+func Spawn(m FactorizationMachine) FactorizationMachine {
+	if cloner, ok := m.(FactorizationMachineSpawner); ok {
+		return cloner.Spawn()
+	}
+	return m
 }
 
 // Marshal model into byte stream.
@@ -577,4 +681,12 @@ func (fm *FM) Unmarshal(r io.Reader) error {
 		return errors.Trace(err)
 	}
 	return nil
+}
+
+func exp(x float32) float32 {
+	e := math32.Exp(x)
+	if math32.IsInf(e, 1) {
+		return math32.MaxFloat32
+	}
+	return e
 }

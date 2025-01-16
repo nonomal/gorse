@@ -18,46 +18,62 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"os"
+	"strings"
+	"time"
+
 	"github.com/emicklei/go-restful/v3"
+	"github.com/google/uuid"
 	"github.com/juju/errors"
 	"github.com/samber/lo"
-	"github.com/scylladb/go-set/strset"
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/cmd/version"
+	"github.com/zhenghaoz/gorse/common/util"
 	"github.com/zhenghaoz/gorse/config"
 	"github.com/zhenghaoz/gorse/protocol"
+	"github.com/zhenghaoz/gorse/storage"
 	"github.com/zhenghaoz/gorse/storage/cache"
 	"github.com/zhenghaoz/gorse/storage/data"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"math"
-	"math/rand"
-	"sync"
-	"time"
 )
 
 // Server manages states of a server node.
 type Server struct {
 	RestServer
+	traceConfig  config.TracingConfig
 	cachePath    string
 	cachePrefix  string
 	dataPath     string
 	dataPrefix   string
+	conn         *grpc.ClientConn
 	masterClient protocol.MasterClient
 	serverName   string
 	masterHost   string
 	masterPort   int
+	tlsConfig    *util.TLSConfig
 	testMode     bool
 	cacheFile    string
 }
 
 // NewServer creates a server node.
-func NewServer(masterHost string, masterPort int, serverHost string, serverPort int, cacheFile string) *Server {
+func NewServer(
+	masterHost string,
+	masterPort int,
+	serverHost string,
+	serverPort int,
+	cacheFile string,
+	tlsConfig *util.TLSConfig,
+) *Server {
 	s := &Server{
 		masterHost: masterHost,
 		masterPort: masterPort,
+		tlsConfig:  tlsConfig,
 		cacheFile:  cacheFile,
 		RestServer: RestServer{
 			Settings:   config.NewSettings(),
@@ -66,8 +82,6 @@ func NewServer(masterHost string, masterPort int, serverHost string, serverPort 
 			WebService: new(restful.WebService),
 		},
 	}
-	s.RestServer.PopularItemsCache = NewPopularItemsCache(&s.RestServer)
-	s.RestServer.HiddenItemsManager = NewHiddenItemsManager(&s.RestServer)
 	return s
 }
 
@@ -81,11 +95,11 @@ func (s *Server) Serve() {
 			log.Logger().Info("no cache file found, create a new one", zap.String("path", s.cacheFile))
 		} else {
 			log.Logger().Error("failed to connect local store", zap.Error(err),
-				zap.String("path", state.path))
+				zap.String("path", s.cacheFile))
 		}
 	}
 	if state.ServerName == "" {
-		state.ServerName = base.GetRandomName(0)
+		state.ServerName = uuid.New().String()
 		err = state.WriteLocalCache()
 		if err != nil {
 			log.Logger().Fatal("failed to write meta", zap.Error(err))
@@ -100,11 +114,21 @@ func (s *Server) Serve() {
 		zap.Int("master_port", s.masterPort))
 
 	// connect to master
-	conn, err := grpc.Dial(fmt.Sprintf("%v:%v", s.masterHost, s.masterPort), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	var opts []grpc.DialOption
+	if s.tlsConfig != nil {
+		c, err := util.NewClientCreds(s.tlsConfig)
+		if err != nil {
+			log.Logger().Fatal("failed to create credentials", zap.Error(err))
+		}
+		opts = append(opts, grpc.WithTransportCredentials(c))
+	} else {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+	s.conn, err = grpc.Dial(fmt.Sprintf("%v:%v", s.masterHost, s.masterPort), opts...)
 	if err != nil {
 		log.Logger().Fatal("failed to connect master", zap.Error(err))
 	}
-	s.masterClient = protocol.NewMasterClient(conn)
+	s.masterClient = protocol.NewMasterClient(s.conn)
 
 	go s.Sync()
 	container := restful.NewContainer()
@@ -127,10 +151,10 @@ func (s *Server) Sync() {
 		var err error
 		if meta, err = s.masterClient.GetMeta(context.Background(),
 			&protocol.NodeInfo{
-				NodeType:      protocol.NodeType_ServerNode,
-				NodeName:      s.serverName,
-				HttpPort:      int64(s.HttpPort),
+				NodeType:      protocol.NodeType_Server,
+				Uuid:          s.serverName,
 				BinaryVersion: version.Version,
+				Hostname:      lo.Must(os.Hostname()),
 			}); err != nil {
 			log.Logger().Error("failed to get meta", zap.Error(err))
 			goto sleep
@@ -144,27 +168,50 @@ func (s *Server) Sync() {
 		}
 
 		// connect to data store
-		if s.dataPath != s.Config.Database.DataStore || s.dataPrefix != s.Config.Database.TablePrefix {
-			log.Logger().Info("connect data store",
-				zap.String("database", log.RedactDBURL(s.Config.Database.DataStore)))
-			if s.DataClient, err = data.Open(s.Config.Database.DataStore, s.Config.Database.TablePrefix); err != nil {
-				log.Logger().Error("failed to connect data store", zap.Error(err))
-				goto sleep
+		if s.dataPath != s.Config.Database.DataStore || s.dataPrefix != s.Config.Database.DataTablePrefix {
+			if strings.HasPrefix(s.Config.Database.DataStore, storage.SQLitePrefix) {
+				log.Logger().Info("connect cache store via master")
+				s.DataClient = data.NewProxyClient(s.conn)
+			} else {
+				log.Logger().Info("connect data store",
+					zap.String("database", log.RedactDBURL(s.Config.Database.DataStore)))
+				if s.DataClient, err = data.Open(s.Config.Database.DataStore, s.Config.Database.DataTablePrefix); err != nil {
+					log.Logger().Error("failed to connect data store", zap.Error(err))
+					goto sleep
+				}
 			}
 			s.dataPath = s.Config.Database.DataStore
-			s.dataPrefix = s.Config.Database.TablePrefix
+			s.dataPrefix = s.Config.Database.DataTablePrefix
 		}
 
 		// connect to cache store
-		if s.cachePath != s.Config.Database.CacheStore || s.cachePrefix != s.Config.Database.TablePrefix {
-			log.Logger().Info("connect cache store",
-				zap.String("database", log.RedactDBURL(s.Config.Database.CacheStore)))
-			if s.CacheClient, err = cache.Open(s.Config.Database.CacheStore, s.Config.Database.TablePrefix); err != nil {
-				log.Logger().Error("failed to connect cache store", zap.Error(err))
-				goto sleep
+		if s.cachePath != s.Config.Database.CacheStore || s.cachePrefix != s.Config.Database.CacheTablePrefix {
+			if strings.HasPrefix(s.Config.Database.CacheStore, storage.SQLitePrefix) {
+				log.Logger().Info("connect cache store via master")
+				s.CacheClient = cache.NewProxyClient(s.conn)
+			} else {
+				log.Logger().Info("connect cache store",
+					zap.String("database", log.RedactDBURL(s.Config.Database.CacheStore)))
+				if s.CacheClient, err = cache.Open(s.Config.Database.CacheStore, s.Config.Database.CacheTablePrefix); err != nil {
+					log.Logger().Error("failed to connect cache store", zap.Error(err))
+					goto sleep
+				}
 			}
 			s.cachePath = s.Config.Database.CacheStore
-			s.cachePrefix = s.Config.Database.TablePrefix
+			s.cachePrefix = s.Config.Database.CacheTablePrefix
+		}
+
+		// create trace provider
+		if !s.traceConfig.Equal(s.Config.Tracing) {
+			log.Logger().Info("create trace provider", zap.Any("tracing_config", s.Config.Tracing))
+			tp, err := s.Config.Tracing.NewTracerProvider()
+			if err != nil {
+				log.Logger().Fatal("failed to create trace provider", zap.Error(err))
+			}
+			otel.SetTracerProvider(tp)
+			otel.SetErrorHandler(log.GetErrorHandler())
+			otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+			s.traceConfig = s.Config.Tracing
 		}
 
 	sleep:
@@ -173,300 +220,4 @@ func (s *Server) Sync() {
 		}
 		time.Sleep(s.Config.Master.MetaTimeout)
 	}
-}
-
-type PopularItemsCache struct {
-	mu     sync.RWMutex
-	scores map[string]float64
-	server *RestServer
-	test   bool
-}
-
-func NewPopularItemsCache(s *RestServer) *PopularItemsCache {
-	sc := &PopularItemsCache{
-		server: s,
-		scores: make(map[string]float64),
-	}
-	go func() {
-		for {
-			sc.sync()
-			log.Logger().Debug("refresh server side popular items cache", zap.String("cache_expire", s.Config.Server.CacheExpire.String()))
-			time.Sleep(s.Config.Server.CacheExpire)
-		}
-	}()
-	return sc
-}
-
-func newPopularItemsCacheForTest(s *RestServer) *PopularItemsCache {
-	sc := &PopularItemsCache{
-		server: s,
-		scores: make(map[string]float64),
-		test:   true,
-	}
-	return sc
-}
-
-func (sc *PopularItemsCache) sync() {
-	// load popular items
-	items, err := sc.server.CacheClient.GetSorted(cache.Key(cache.PopularItems), 0, -1)
-	if err != nil {
-		if !errors.Is(err, errors.NotAssigned) {
-			log.Logger().Error("failed to get popular items", zap.Error(err))
-		}
-		return
-	}
-	scores := make(map[string]float64)
-	for _, item := range items {
-		scores[item.Id] = item.Score
-	}
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	sc.scores = scores
-}
-
-func (sc *PopularItemsCache) GetSortedScore(member string) float64 {
-	if sc.test {
-		sc.sync()
-	}
-	sc.mu.RLock()
-	defer sc.mu.RUnlock()
-	return sc.scores[member]
-}
-
-type HiddenItemsManager struct {
-	server                  *RestServer
-	mu                      sync.RWMutex
-	hiddenItems             *strset.Set // global hidden items
-	hiddenItemsInCategories sync.Map    // categorized hidden items
-	updateTime              time.Time
-	test                    bool
-}
-
-func NewHiddenItemsManager(s *RestServer) *HiddenItemsManager {
-	hc := &HiddenItemsManager{
-		server:      s,
-		hiddenItems: strset.New(),
-	}
-	go func() {
-		for {
-			hc.sync()
-			log.Logger().Debug("refresh server side hidden items cache", zap.String("cache_expire", s.Config.Server.CacheExpire.String()))
-			time.Sleep(hc.server.Config.Server.CacheExpire)
-		}
-	}()
-	return hc
-}
-
-func newHiddenItemsManagerForTest(s *RestServer) *HiddenItemsManager {
-	hc := &HiddenItemsManager{
-		server:      s,
-		hiddenItems: strset.New(),
-		test:        true,
-	}
-	return hc
-}
-
-func (hc *HiddenItemsManager) sync() {
-	ts := time.Now()
-	// load categories
-	categories, err := hc.server.CacheClient.GetSet(cache.ItemCategories)
-	if err != nil {
-		if !errors.Is(err, errors.NotAssigned) {
-			log.Logger().Error("failed to load item categories", zap.Error(err))
-		}
-		return
-	}
-	// load hidden items
-	score, err := hc.server.CacheClient.GetSortedByScore(cache.HiddenItemsV2, math.Inf(-1), float64(ts.Unix()))
-	if err != nil {
-		if !errors.Is(err, errors.NotAssigned) {
-			log.Logger().Error("failed to load hidden items", zap.Error(err))
-		}
-		return
-	}
-	hiddenItems := strset.New(cache.RemoveScores(score)...)
-	// load hidden items in categories
-	for _, category := range categories {
-		score, err = hc.server.CacheClient.GetSortedByScore(cache.Key(cache.HiddenItemsV2, category), math.Inf(-1), float64(ts.Unix()))
-		if err != nil {
-			if !errors.Is(err, errors.NotAssigned) {
-				log.Logger().Error("failed to load categorized hidden items", zap.Error(err))
-			}
-			return
-		}
-		hc.hiddenItemsInCategories.Store(category, strset.New(cache.RemoveScores(score)...))
-	}
-	hc.mu.Lock()
-	defer hc.mu.Unlock()
-	hc.hiddenItems = hiddenItems
-	hc.updateTime = ts
-}
-
-func (hc *HiddenItemsManager) IsHidden(members []string, category string) ([]bool, error) {
-	if hc.test {
-		hc.sync()
-	}
-	// load hidden items
-	hc.mu.RLock()
-	hiddenItems := hc.hiddenItems
-	updateTime := hc.updateTime
-	hc.mu.RUnlock()
-	// load hidden items in category
-	hiddenItemsInCategory := strset.New()
-	if category != "" {
-		if temp, exist := hc.hiddenItemsInCategories.Load(category); exist {
-			hiddenItemsInCategory = temp.(*strset.Set)
-		}
-	}
-	// load delta hidden items
-	score, err := hc.server.CacheClient.GetSortedByScore(cache.HiddenItemsV2, float64(updateTime.Unix()), float64(time.Now().Unix()))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	deltaHiddenItems := strset.New(cache.RemoveScores(score)...)
-	// load delta hidden items in category
-	deltaHiddenItemsInCategory := strset.New()
-	if category != "" {
-		score, err = hc.server.CacheClient.GetSortedByScore(cache.Key(cache.HiddenItemsV2, category), float64(updateTime.Unix()), float64(time.Now().Unix()))
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		deltaHiddenItemsInCategory = strset.New(cache.RemoveScores(score)...)
-	}
-	return lo.Map(members, func(t string, i int) bool {
-		return hiddenItems.Has(t) || deltaHiddenItems.Has(t) || hiddenItemsInCategory.Has(t) || deltaHiddenItemsInCategory.Has(t)
-	}), nil
-}
-
-func (hc *HiddenItemsManager) IsHiddenInCache(member string, category string) bool {
-	if hc.test {
-		hc.sync()
-	}
-	// load hidden items
-	hc.mu.RLock()
-	hiddenItems := hc.hiddenItems
-	hc.mu.RUnlock()
-	// load hidden items in category
-	hiddenItemsInCategory := strset.New()
-	if category != "" {
-		if temp, exist := hc.hiddenItemsInCategories.Load(category); exist {
-			hiddenItemsInCategory = temp.(*strset.Set)
-		}
-	}
-	return hiddenItems.Has(member) || hiddenItemsInCategory.Has(member)
-}
-
-type CacheModification struct {
-	client             cache.Database
-	deletion           []cache.SetMember
-	insertion          []cache.SortedSet
-	hiddenItemsManager *HiddenItemsManager
-}
-
-func NewCacheModification(client cache.Database, hiddenItemsManager *HiddenItemsManager) *CacheModification {
-	return &CacheModification{
-		client:             client,
-		hiddenItemsManager: hiddenItemsManager,
-	}
-}
-
-func (cm *CacheModification) deleteItemCategory(itemId, category string) *CacheModification {
-	cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.HiddenItemsV2, category), []cache.Scored{{itemId, float64(time.Now().Unix())}}))
-	return cm
-}
-
-func (cm *CacheModification) addItemCategory(itemId, category string, latest, popular float64) *CacheModification {
-	// 1. insert item to latest and popular
-	if latest > 0 {
-		cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.LatestItems, category), []cache.Scored{{itemId, latest}}))
-	}
-	if popular > 0 {
-		cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.PopularItems, category), []cache.Scored{{itemId, popular}}))
-	}
-	// 2. remove delete mark
-	if cm.hiddenItemsManager.IsHiddenInCache(itemId, category) {
-		cm.deletion = append(cm.deletion, cache.Member(cache.Key(cache.HiddenItemsV2, category), itemId))
-	}
-	return cm
-}
-
-func (cm *CacheModification) modifyItem(itemId string, prevCategories, categories []string, latest, popular float64) *CacheModification {
-	prevCategoriesSet := strset.New(prevCategories...)
-	categoriesSet := strset.New(categories...)
-	// 2. insert item to category latest and popular
-	if latest > 0 {
-		cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.LatestItems), []cache.Scored{{itemId, latest}}))
-	}
-	if popular > 0 {
-		cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.PopularItems), []cache.Scored{{itemId, popular}}))
-	}
-	for _, category := range categories {
-		// 2. insert item to category latest and popular
-		if latest > 0 {
-			cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.LatestItems, category), []cache.Scored{{itemId, latest}}))
-		}
-		if popular > 0 {
-			cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.PopularItems, category), []cache.Scored{{itemId, popular}}))
-		}
-		// 3. remove delete mark
-		if !prevCategoriesSet.Has(category) && cm.hiddenItemsManager.IsHiddenInCache(itemId, category) {
-			cm.deletion = append(cm.deletion, cache.Member(cache.Key(cache.HiddenItemsV2, category), itemId))
-		}
-	}
-	// 4. insert category delete mark
-	for _, category := range prevCategories {
-		if !categoriesSet.Has(category) {
-			cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.HiddenItemsV2, category), []cache.Scored{{itemId, float64(time.Now().Unix())}}))
-		}
-	}
-	return cm
-}
-
-func (cm *CacheModification) HideItem(itemId string) *CacheModification {
-	cm.insertion = append(cm.insertion, cache.Sorted(cache.HiddenItemsV2, []cache.Scored{{itemId, float64(time.Now().Unix())}}))
-	return cm
-}
-
-func (cm *CacheModification) unHideItem(itemId string) *CacheModification {
-	if cm.hiddenItemsManager.IsHiddenInCache(itemId, "") {
-		cm.deletion = append(cm.deletion, cache.Member(cache.HiddenItemsV2, itemId))
-	}
-	return cm
-}
-
-func (cm *CacheModification) addItem(itemId string, categories []string, latest, popular float64) {
-	// 1. insert item to global latest and popular
-	if latest > 0 {
-		cm.insertion = append(cm.insertion, cache.Sorted(cache.LatestItems, []cache.Scored{{itemId, latest}}))
-	}
-	if popular > 0 {
-		cm.insertion = append(cm.insertion, cache.Sorted(cache.PopularItems, []cache.Scored{{itemId, popular}}))
-	}
-	for _, category := range categories {
-		// 2. insert item to category latest and popular
-		if latest > 0 {
-			cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.LatestItems, category), []cache.Scored{{itemId, latest}}))
-		}
-		if popular > 0 {
-			cm.insertion = append(cm.insertion, cache.Sorted(cache.Key(cache.PopularItems, category), []cache.Scored{{itemId, popular}}))
-		}
-	}
-	// 3. remove delete mark
-	if cm.hiddenItemsManager.IsHiddenInCache(itemId, "") {
-		cm.deletion = append(cm.deletion, cache.Member(cache.HiddenItemsV2, itemId))
-	}
-}
-
-func (cm *CacheModification) Exec() error {
-	if len(cm.deletion) > 0 {
-		if err := cm.client.RemSorted(cm.deletion...); err != nil {
-			return errors.Trace(err)
-		}
-	}
-	if len(cm.insertion) > 0 {
-		if err := cm.client.AddSorted(cm.insertion...); err != nil {
-			return errors.Trace(err)
-		}
-	}
-	return nil
 }

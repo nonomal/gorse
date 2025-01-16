@@ -14,13 +14,14 @@
 package click
 
 import (
+	"context"
+	"io"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/model"
-	"io"
-	"testing"
 )
 
 // NewMapIndexDataset creates a data set.
@@ -32,14 +33,6 @@ func NewMapIndexDataset() *Dataset {
 
 type mockFactorizationMachineForSearch struct {
 	model.BaseModel
-}
-
-func (m *mockFactorizationMachineForSearch) Complexity() int {
-	panic("implement me")
-}
-
-func (m *mockFactorizationMachineForSearch) Bytes() int {
-	panic("implement me")
 }
 
 func (m *mockFactorizationMachineForSearch) Marshal(_ io.Writer) error {
@@ -58,16 +51,15 @@ func (m *mockFactorizationMachineForSearch) GetItemIndex() base.Index {
 	panic("don't call me")
 }
 
-func (m *mockFactorizationMachineForSearch) Fit(_, _ *Dataset, cfg *FitConfig) Score {
+func (m *mockFactorizationMachineForSearch) Fit(_ context.Context, _, _ *Dataset, cfg *FitConfig) Score {
 	score := float32(0)
 	score += m.Params.GetFloat32(model.NFactors, 0.0)
 	score += m.Params.GetFloat32(model.InitMean, 0.0)
 	score += m.Params.GetFloat32(model.InitStdDev, 0.0)
-	cfg.Task.Add(m.Params.GetInt(model.NEpochs, 0))
 	return Score{Task: FMClassification, AUC: score}
 }
 
-func (m *mockFactorizationMachineForSearch) Predict(_, _ string, _, _ []string) float32 {
+func (m *mockFactorizationMachineForSearch) Predict(_, _ string, _, _ []Feature) float32 {
 	panic("don't call me")
 }
 
@@ -87,37 +79,17 @@ func (m *mockFactorizationMachineForSearch) GetParamsGrid(_ bool) model.ParamsGr
 	}
 }
 
-type mockRunner struct {
-	mock.Mock
-}
-
-func (r *mockRunner) Lock() {
-	r.Called()
-}
-
-func (r *mockRunner) UnLock() {
-	r.Called()
-}
-
 func newFitConfigForSearch() *FitConfig {
-	t := task.NewTask("test", 0)
 	return &FitConfig{
-		Jobs:    1,
 		Verbose: 1,
-		Task:    t,
 	}
 }
 
 func TestGridSearchCV(t *testing.T) {
 	m := &mockFactorizationMachineForSearch{}
 	fitConfig := newFitConfigForSearch()
-	runner := new(mockRunner)
-	runner.On("Lock")
-	runner.On("UnLock")
-	r := GridSearchCV(m, nil, nil, m.GetParamsGrid(false), 0, fitConfig, runner)
+	r := GridSearchCV(context.Background(), m, nil, nil, m.GetParamsGrid(false), 0, fitConfig)
 	assert.Equal(t, float32(12), r.BestScore.AUC)
-	runner.AssertCalled(t, "Lock")
-	runner.AssertCalled(t, "UnLock")
 	assert.Equal(t, model.Params{
 		model.NFactors:   4,
 		model.InitMean:   4,
@@ -128,12 +100,7 @@ func TestGridSearchCV(t *testing.T) {
 func TestRandomSearchCV(t *testing.T) {
 	m := &mockFactorizationMachineForSearch{}
 	fitConfig := newFitConfigForSearch()
-	runner := new(mockRunner)
-	runner.On("Lock")
-	runner.On("UnLock")
-	r := RandomSearchCV(m, nil, nil, m.GetParamsGrid(false), 63, 0, fitConfig, runner)
-	runner.AssertCalled(t, "Lock")
-	runner.AssertCalled(t, "UnLock")
+	r := RandomSearchCV(context.Background(), m, nil, nil, m.GetParamsGrid(false), 63, 0, fitConfig)
 	assert.Equal(t, float32(12), r.BestScore.AUC)
 	assert.Equal(t, model.Params{
 		model.NFactors:   4,
@@ -143,13 +110,9 @@ func TestRandomSearchCV(t *testing.T) {
 }
 
 func TestModelSearcher_RandomSearch(t *testing.T) {
-	runner := new(mockRunner)
-	runner.On("Lock")
-	runner.On("UnLock")
-	searcher := NewModelSearcher(2, 63, 1, false)
+	searcher := NewModelSearcher(2, 63, false)
 	searcher.model = &mockFactorizationMachineForSearch{model.BaseModel{Params: model.Params{model.NEpochs: 2}}}
-	tk := task.NewTask("test", searcher.Complexity())
-	err := searcher.Fit(NewMapIndexDataset(), NewMapIndexDataset(), tk, runner)
+	err := searcher.Fit(context.Background(), NewMapIndexDataset(), NewMapIndexDataset(), task.NewConstantJobsAllocator(1))
 	assert.NoError(t, err)
 	m, score := searcher.GetBestModel()
 	assert.Equal(t, float32(12), score.AUC)
@@ -159,17 +122,12 @@ func TestModelSearcher_RandomSearch(t *testing.T) {
 		model.InitMean:   4,
 		model.InitStdDev: 4,
 	}, m.GetParams())
-	assert.Equal(t, searcher.Complexity(), tk.Done)
 }
 
 func TestModelSearcher_GridSearch(t *testing.T) {
-	runner := new(mockRunner)
-	runner.On("Lock")
-	runner.On("UnLock")
-	searcher := NewModelSearcher(2, 64, 1, false)
+	searcher := NewModelSearcher(2, 64, false)
 	searcher.model = &mockFactorizationMachineForSearch{model.BaseModel{Params: model.Params{model.NEpochs: 2}}}
-	tk := task.NewTask("test", searcher.Complexity())
-	err := searcher.Fit(NewMapIndexDataset(), NewMapIndexDataset(), tk, runner)
+	err := searcher.Fit(context.Background(), NewMapIndexDataset(), NewMapIndexDataset(), task.NewConstantJobsAllocator(1))
 	assert.NoError(t, err)
 	m, score := searcher.GetBestModel()
 	assert.Equal(t, float32(12), score.AUC)
@@ -179,5 +137,4 @@ func TestModelSearcher_GridSearch(t *testing.T) {
 		model.InitMean:   4,
 		model.InitStdDev: 4,
 	}, m.GetParams())
-	assert.Equal(t, searcher.Complexity(), tk.Done)
 }

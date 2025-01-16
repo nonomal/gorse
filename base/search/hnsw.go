@@ -15,19 +15,21 @@
 package search
 
 import (
+	"context"
+	"math/rand"
+	"runtime"
+	"sync"
+	"time"
+
 	"github.com/chewxy/math32"
-	"github.com/scylladb/go-set/i32set"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/base/heap"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/base/parallel"
-	"github.com/zhenghaoz/gorse/base/task"
+	"github.com/zhenghaoz/gorse/base/progress"
 	"go.uber.org/zap"
-	"math/rand"
 	"modernc.org/mathutil"
-	"runtime"
-	"sync"
-	"time"
 )
 
 var _ VectorIndex = &HNSW{}
@@ -46,9 +48,9 @@ type HNSW struct {
 	levelFactor    float32
 	maxConnection  int // maximum number of connections for each element per layer
 	maxConnection0 int
+	ef             int
 	efConstruction int
 	numJobs        int
-	task           *task.SubTask
 }
 
 // HNSWConfig is the configuration function for HNSW.
@@ -77,6 +79,14 @@ func SetEFConstruction(efConstruction int) HNSWConfig {
 	}
 }
 
+// SetEF sets the EF search value in HNSW.
+// By default ef for search is the same as efConstruction. To return it to this default behavior, set it to 0.
+func SetEF(ef int) HNSWConfig {
+	return func(h *HNSW) {
+		h.ef = ef
+	}
+}
+
 // NewHNSW builds a vector index based on Hierarchical Navigable Small Worlds.
 func NewHNSW(vectors []Vector, configs ...HNSWConfig) *HNSW {
 	h := &HNSW{
@@ -95,7 +105,7 @@ func NewHNSW(vectors []Vector, configs ...HNSWConfig) *HNSW {
 
 // Search a vector in Hierarchical Navigable Small Worlds.
 func (h *HNSW) Search(q Vector, n int, prune0 bool) (values []int32, scores []float32) {
-	w := h.knnSearch(q, n, mathutil.Max(h.efConstruction, n))
+	w := h.knnSearch(q, n, h.efSearchValue(n))
 	for w.Len() > 0 {
 		value, score := w.Pop()
 		if !prune0 || score < 0 {
@@ -122,24 +132,26 @@ func (h *HNSW) knnSearch(q Vector, k, ef int) *heap.PriorityQueue {
 }
 
 // Build a vector index on data.
-func (h *HNSW) Build() {
+func (h *HNSW) Build(ctx context.Context) {
 	completed := make(chan struct{}, h.numJobs)
 	go func() {
 		defer base.CheckPanic()
 		completedCount, previousCount := 0, 0
 		ticker := time.NewTicker(10 * time.Second)
+		_, span := progress.Start(ctx, "HNSW.Build", len(h.vectors))
 		for {
 			select {
 			case _, ok := <-completed:
 				if !ok {
+					span.End()
 					return
 				}
 				completedCount++
 			case <-ticker.C:
 				throughput := completedCount - previousCount
 				previousCount = completedCount
-				h.task.Add(throughput * len(h.vectors))
 				if throughput > 0 {
+					span.Add(throughput)
 					log.Logger().Info("building index",
 						zap.Int("n_indexed_vectors", completedCount),
 						zap.Int("n_vectors", len(h.vectors)),
@@ -231,9 +243,9 @@ func (h *HNSW) insert(q int32) {
 
 func (h *HNSW) searchLayer(q Vector, enterPoints *heap.PriorityQueue, ef, currentLayer int) *heap.PriorityQueue {
 	var (
-		v          = i32set.New(enterPoints.Values()...) // set of visited elements
-		candidates = enterPoints.Clone()                 // set of candidates
-		w          = enterPoints.Reverse()               // dynamic list of found nearest upperNeighbors
+		v          = mapset.NewSet(enterPoints.Values()...) // set of visited elements
+		candidates = enterPoints.Clone()                    // set of candidates
+		w          = enterPoints.Reverse()                  // dynamic list of found nearest upperNeighbors
 	)
 	for candidates.Len() > 0 {
 		// extract nearest element from candidates to q
@@ -250,7 +262,7 @@ func (h *HNSW) searchLayer(q Vector, enterPoints *heap.PriorityQueue, ef, curren
 		neighbors := h.getNeighbourhood(c, currentLayer).Values()
 		h.nodeMutexes[c].RUnlock()
 		for _, e := range neighbors {
-			if !v.Has(e) {
+			if !v.Contains(e) {
 				v.Add(e)
 				// get the furthest element from w to q
 				_, fq = w.Peek()
@@ -319,15 +331,15 @@ func NewHNSWBuilder(data []Vector, k, numJobs int) *HNSWBuilder {
 		rng:        base.NewRandomGenerator(0),
 		numJobs:    numJobs,
 	}
-	b.bruteForce.Build()
+	b.bruteForce.Build(context.Background())
 	return b
 }
 
 func recall(expected, actual []int32) float32 {
 	var result float32
-	truth := i32set.New(expected...)
+	truth := mapset.NewSet(expected...)
 	for _, v := range actual {
-		if truth.Has(v) {
+		if truth.Contains(v) {
 			result++
 		}
 	}
@@ -360,20 +372,19 @@ func (b *HNSWBuilder) evaluate(idx *HNSW, prune0 bool) float32 {
 	return result / count
 }
 
-func (b *HNSWBuilder) Build(recall float32, trials int, prune0 bool, t *task.Task) (idx *HNSW, score float32) {
-	buildTask := t.SubTask(EstimateHNSWBuilderComplexity(len(b.data), trials))
-	defer buildTask.Finish()
+func (b *HNSWBuilder) Build(ctx context.Context, recall float32, trials int, prune0 bool) (idx *HNSW, score float32) {
 	ef := 1 << int(math32.Ceil(math32.Log2(float32(b.k))))
+	newCtx, span := progress.Start(ctx, "HNSWBuilder.Build", trials)
+	defer span.End()
 	for i := 0; i < trials; i++ {
 		start := time.Now()
 		idx = NewHNSW(b.data,
 			SetEFConstruction(ef),
 			SetHNSWNumJobs(b.numJobs))
-		idx.task = buildTask
-		idx.Build()
+		idx.Build(newCtx)
 		buildTime := time.Since(start)
 		score = b.evaluate(idx, prune0)
-		idx.task.Add(b.testSize * len(b.data))
+		span.Add(1)
 		log.Logger().Info("try to build vector index",
 			zap.String("index_type", "HNSW"),
 			zap.Int("ef_construction", ef),
@@ -416,7 +427,7 @@ func (h *HNSW) MultiSearch(q Vector, terms []string, n int, prune0 bool) (values
 		scores[term] = make([]float32, 0, n)
 	}
 
-	w := h.efSearch(q, mathutil.Max(h.efConstruction, n))
+	w := h.efSearch(q, h.efSearchValue(n))
 	for w.Len() > 0 {
 		value, score := w.Pop()
 		if !prune0 || score < 0 {
@@ -448,6 +459,14 @@ func (h *HNSW) efSearch(q Vector, ef int) *heap.PriorityQueue {
 	}
 	w = h.searchLayer(q, enterPoints, ef, 0)
 	return w
+}
+
+// efSearchValue returns the efSearch value to use, given the current number of elements desired.
+func (h *HNSW) efSearchValue(n int) int {
+	if h.ef > 0 {
+		return mathutil.Max(h.ef, n)
+	}
+	return mathutil.Max(h.efConstruction, n)
 }
 
 func EstimateHNSWBuilderComplexity(dataSize, trials int) int {

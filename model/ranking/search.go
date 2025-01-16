@@ -15,14 +15,17 @@
 package ranking
 
 import (
+	"context"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/zhenghaoz/gorse/base"
 	"github.com/zhenghaoz/gorse/base/log"
+	"github.com/zhenghaoz/gorse/base/progress"
 	"github.com/zhenghaoz/gorse/base/task"
 	"github.com/zhenghaoz/gorse/model"
 	"go.uber.org/zap"
-	"sync"
-	"time"
 )
 
 // ParamsSearchResult contains the return of grid search.
@@ -46,35 +49,30 @@ func (r *ParamsSearchResult) AddScore(params model.Params, score Score) {
 }
 
 // GridSearchCV finds the best parameters for a model.
-func GridSearchCV(estimator MatrixFactorization, trainSet *DataSet, testSet *DataSet, paramGrid model.ParamsGrid,
-	_ int64, fitConfig *FitConfig, runner model.Runner) ParamsSearchResult {
+func GridSearchCV(ctx context.Context, estimator MatrixFactorization, trainSet *DataSet, testSet *DataSet, paramGrid model.ParamsGrid,
+	_ int64, fitConfig *FitConfig) ParamsSearchResult {
 	// Retrieve parameter names and length
 	paramNames := make([]model.ParamName, 0, len(paramGrid))
-	count := 1
+	total := 1
 	for paramName, values := range paramGrid {
 		paramNames = append(paramNames, paramName)
-		count *= len(values)
+		total *= len(values)
 	}
 	// Construct DFS procedure
 	results := ParamsSearchResult{
-		Scores: make([]Score, 0, count),
-		Params: make([]model.Params, 0, count),
+		Scores: make([]Score, 0, total),
+		Params: make([]model.Params, 0, total),
 	}
 	var dfs func(deep int, params model.Params)
-	progress := 0
+	newCtx, span := progress.Start(ctx, "GridSearchCV", total)
 	dfs = func(deep int, params model.Params) {
 		if deep == len(paramNames) {
-			progress++
-			log.Logger().Info(fmt.Sprintf("grid search (%v/%v)", progress, count),
+			log.Logger().Info(fmt.Sprintf("grid search (%v/%v)", span.Count(), total),
 				zap.Any("params", params))
 			// Cross validate
 			estimator.Clear()
 			estimator.SetParams(estimator.GetParams().Overwrite(params))
-			fitConfig.Task.Suspend(true)
-			runner.Lock()
-			fitConfig.Task.Suspend(false)
-			score := estimator.Fit(trainSet, testSet, fitConfig)
-			runner.UnLock()
+			score := estimator.Fit(newCtx, trainSet, testSet, fitConfig)
 			// Create GridSearch result
 			results.Scores = append(results.Scores, score)
 			results.Params = append(results.Params, params.Copy())
@@ -84,6 +82,7 @@ func GridSearchCV(estimator MatrixFactorization, trainSet *DataSet, testSet *Dat
 				results.BestParams = params.Copy()
 				results.BestIndex = len(results.Params) - 1
 			}
+			span.Add(1)
 		} else {
 			paramName := paramNames[deep]
 			values := paramGrid[paramName]
@@ -95,21 +94,23 @@ func GridSearchCV(estimator MatrixFactorization, trainSet *DataSet, testSet *Dat
 	}
 	params := make(map[model.ParamName]interface{})
 	dfs(0, params)
+	span.End()
 	return results
 }
 
 // RandomSearchCV searches hyper-parameters by random.
-func RandomSearchCV(estimator MatrixFactorization, trainSet *DataSet, testSet *DataSet, paramGrid model.ParamsGrid,
-	numTrials int, seed int64, fitConfig *FitConfig, runner model.Runner) ParamsSearchResult {
+func RandomSearchCV(ctx context.Context, estimator MatrixFactorization, trainSet *DataSet, testSet *DataSet, paramGrid model.ParamsGrid,
+	numTrials int, seed int64, fitConfig *FitConfig) ParamsSearchResult {
 	// if the number of combination is less than number of trials, use grid search
 	if paramGrid.NumCombinations() < numTrials {
-		return GridSearchCV(estimator, trainSet, testSet, paramGrid, seed, fitConfig, runner)
+		return GridSearchCV(ctx, estimator, trainSet, testSet, paramGrid, seed, fitConfig)
 	}
 	rng := base.NewRandomGenerator(seed)
 	results := ParamsSearchResult{
 		Scores: make([]Score, 0, numTrials),
 		Params: make([]model.Params, 0, numTrials),
 	}
+	newCtx, span := progress.Start(ctx, "RandomSearchCV", numTrials)
 	for i := 1; i <= numTrials; i++ {
 		// Make parameters
 		params := model.Params{}
@@ -122,11 +123,7 @@ func RandomSearchCV(estimator MatrixFactorization, trainSet *DataSet, testSet *D
 			zap.Any("params", params))
 		estimator.Clear()
 		estimator.SetParams(estimator.GetParams().Overwrite(params))
-		fitConfig.Task.Suspend(true)
-		runner.Lock()
-		fitConfig.Task.Suspend(false)
-		score := estimator.Fit(trainSet, testSet, fitConfig)
-		runner.UnLock()
+		score := estimator.Fit(newCtx, trainSet, testSet, fitConfig)
 		results.Scores = append(results.Scores, score)
 		results.Params = append(results.Params, params.Copy())
 		if len(results.Scores) == 0 || score.NDCG > results.BestScore.NDCG {
@@ -135,7 +132,9 @@ func RandomSearchCV(estimator MatrixFactorization, trainSet *DataSet, testSet *D
 			results.BestParams = params.Copy()
 			results.BestIndex = len(results.Params) - 1
 		}
+		span.Add(1)
 	}
+	span.End()
 	return results
 }
 
@@ -145,7 +144,6 @@ type ModelSearcher struct {
 	// arguments
 	numEpochs  int
 	numTrials  int
-	numJobs    int
 	searchSize bool
 	// results
 	bestMutex     sync.Mutex
@@ -155,11 +153,10 @@ type ModelSearcher struct {
 }
 
 // NewModelSearcher creates a thread-safe personal ranking model searcher.
-func NewModelSearcher(nEpoch, nTrials, nJobs int, searchSize bool) *ModelSearcher {
+func NewModelSearcher(nEpoch, nTrials int, searchSize bool) *ModelSearcher {
 	searcher := &ModelSearcher{
 		numTrials:  nTrials,
 		numEpochs:  nEpoch,
-		numJobs:    nJobs,
 		searchSize: searchSize,
 	}
 	searcher.models = append(searcher.models, NewBPR(model.Params{model.NEpochs: searcher.numEpochs}))
@@ -174,20 +171,14 @@ func (searcher *ModelSearcher) GetBestModel() (string, MatrixFactorization, Scor
 	return searcher.bestModelName, searcher.bestModel, searcher.bestScore
 }
 
-func (searcher *ModelSearcher) Complexity() int {
-	return len(searcher.models) * searcher.numEpochs * searcher.numTrials
-}
-
-func (searcher *ModelSearcher) Fit(trainSet, valSet *DataSet, t *task.Task, runner model.Runner) error {
+func (searcher *ModelSearcher) Fit(ctx context.Context, trainSet, valSet *DataSet, j *task.JobsAllocator) error {
 	log.Logger().Info("ranking model search",
 		zap.Int("n_users", trainSet.UserCount()),
 		zap.Int("n_items", trainSet.ItemCount()))
 	startTime := time.Now()
 	for _, m := range searcher.models {
-		r := RandomSearchCV(m, trainSet, valSet, m.GetParamsGrid(searcher.searchSize), searcher.numTrials, 0,
-			NewFitConfig().
-				SetJobs(searcher.numJobs).
-				SetTask(t), runner)
+		r := RandomSearchCV(ctx, m, trainSet, valSet, m.GetParamsGrid(searcher.searchSize), searcher.numTrials, 0,
+			NewFitConfig().SetJobsAllocator(j))
 		searcher.bestMutex.Lock()
 		if searcher.bestModel == nil || r.BestScore.NDCG > searcher.bestScore.NDCG {
 			searcher.bestModel = r.BestModel

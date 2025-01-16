@@ -14,213 +14,472 @@
 package cache
 
 import (
-	"github.com/juju/errors"
-	"github.com/stretchr/testify/assert"
+	"context"
+	"io"
 	"math"
+	"math/rand"
+	"os"
+	"strconv"
 	"testing"
 	"time"
+
+	"github.com/fxtlabs/primes"
+	"github.com/juju/errors"
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+	"google.golang.org/protobuf/proto"
 )
 
-func testMeta(t *testing.T, db Database) {
+type baseTestSuite struct {
+	suite.Suite
+	Database
+}
+
+func (suite *baseTestSuite) TearDownSuite() {
+	err := suite.Database.Close()
+	suite.NoError(err)
+}
+
+func (suite *baseTestSuite) SetupTest() {
+	err := suite.Database.Ping()
+	suite.NoError(err)
+	err = suite.Database.Purge()
+	suite.NoError(err)
+}
+
+func (suite *baseTestSuite) TearDownTest() {
+	err := suite.Database.Purge()
+	suite.NoError(err)
+}
+
+func (suite *baseTestSuite) TestInit() {
+	err := suite.Database.Init()
+	suite.NoError(err)
+}
+
+func (suite *baseTestSuite) TestMeta() {
+	ctx := context.Background()
 	// Set meta string
-	err := db.Set(String(Key("meta", "1"), "2"), String(Key("meta", "1000"), "10"))
-	assert.NoError(t, err)
+	err := suite.Database.Set(ctx, String(Key("meta", "1"), "2"), String(Key("meta", "1000"), "10"))
+	suite.NoError(err)
 	// Get meta string
-	value, err := db.Get(Key("meta", "1")).String()
-	assert.NoError(t, err)
-	assert.Equal(t, "2", value)
-	value, err = db.Get(Key("meta", "1000")).String()
-	assert.NoError(t, err)
-	assert.Equal(t, "10", value)
+	value, err := suite.Database.Get(ctx, Key("meta", "1")).String()
+	suite.NoError(err)
+	suite.Equal("2", value)
+	value, err = suite.Database.Get(ctx, Key("meta", "1000")).String()
+	suite.NoError(err)
+	suite.Equal("10", value)
 	// Delete string
-	err = db.Delete(Key("meta", "1"))
-	assert.NoError(t, err)
+	err = suite.Database.Delete(ctx, Key("meta", "1"))
+	suite.NoError(err)
 	// Get meta not existed
-	value, err = db.Get(Key("meta", "1")).String()
-	assert.True(t, errors.Is(err, errors.NotFound), err)
-	assert.Equal(t, "", value)
+	value, err = suite.Database.Get(ctx, Key("meta", "1")).String()
+	suite.True(errors.Is(err, errors.NotFound), err)
+	suite.Equal("", value)
 	// Set meta int
-	err = db.Set(Integer(Key("meta", "1"), 2))
-	assert.NoError(t, err)
+	err = suite.Database.Set(ctx, Integer(Key("meta", "1"), 2))
+	suite.NoError(err)
 	// Get meta int
-	valInt, err := db.Get(Key("meta", "1")).Integer()
-	assert.NoError(t, err)
-	assert.Equal(t, 2, valInt)
+	valInt, err := suite.Database.Get(ctx, Key("meta", "1")).Integer()
+	suite.NoError(err)
+	suite.Equal(2, valInt)
 	// set meta time
-	err = db.Set(Time(Key("meta", "1"), time.Date(1996, 4, 8, 0, 0, 0, 0, time.UTC)))
-	assert.NoError(t, err)
+	err = suite.Database.Set(ctx, Time(Key("meta", "1"), time.Date(1996, 4, 8, 0, 0, 0, 0, time.UTC)))
+	suite.NoError(err)
 	// get meta time
-	valTime, err := db.Get(Key("meta", "1")).Time()
-	assert.NoError(t, err)
-	assert.Equal(t, 1996, valTime.Year())
-	assert.Equal(t, time.Month(4), valTime.Month())
-	assert.Equal(t, 8, valTime.Day())
+	valTime, err := suite.Database.Get(ctx, Key("meta", "1")).Time()
+	suite.NoError(err)
+	suite.Equal(1996, valTime.Year())
+	suite.Equal(time.Month(4), valTime.Month())
+	suite.Equal(8, valTime.Day())
 
 	// test set empty
-	err = db.Set()
-	assert.NoError(t, err)
+	err = suite.Database.Set(ctx)
+	suite.NoError(err)
 	// test set duplicate
-	err = db.Set(String("100", "1"), String("100", "2"))
-	assert.NoError(t, err)
+	err = suite.Database.Set(ctx, String("100", "1"), String("100", "2"))
+	suite.NoError(err)
 }
 
-func testSet(t *testing.T, db Database) {
-	err := db.SetSet("set", "1")
-	assert.NoError(t, err)
+func (suite *baseTestSuite) TestSet() {
+	ctx := context.Background()
+	err := suite.Database.SetSet(ctx, "set", "1")
+	suite.NoError(err)
 	// test add
-	err = db.AddSet("set", "2")
-	assert.NoError(t, err)
+	err = suite.Database.AddSet(ctx, "set", "2")
+	suite.NoError(err)
 	var members []string
-	members, err = db.GetSet("set")
-	assert.NoError(t, err)
-	assert.Equal(t, []string{"1", "2"}, members)
+	members, err = suite.Database.GetSet(ctx, "set")
+	suite.NoError(err)
+	suite.Equal([]string{"1", "2"}, members)
 	// test rem
-	err = db.RemSet("set", "1")
-	assert.NoError(t, err)
-	members, err = db.GetSet("set")
-	assert.NoError(t, err)
-	assert.Equal(t, []string{"2"}, members)
+	err = suite.Database.RemSet(ctx, "set", "1")
+	suite.NoError(err)
+	members, err = suite.Database.GetSet(ctx, "set")
+	suite.NoError(err)
+	suite.Equal([]string{"2"}, members)
 	// test set
-	err = db.SetSet("set", "3")
-	assert.NoError(t, err)
-	members, err = db.GetSet("set")
-	assert.NoError(t, err)
-	assert.Equal(t, []string{"3"}, members)
+	err = suite.Database.SetSet(ctx, "set", "3")
+	suite.NoError(err)
+	members, err = suite.Database.GetSet(ctx, "set")
+	suite.NoError(err)
+	suite.Equal([]string{"3"}, members)
 
 	// test add empty
-	err = db.AddSet("set")
-	assert.NoError(t, err)
+	err = suite.Database.AddSet(ctx, "set")
+	suite.NoError(err)
 	// test set empty
-	err = db.SetSet("set")
-	assert.NoError(t, err)
+	err = suite.Database.SetSet(ctx, "set")
+	suite.NoError(err)
 	// test get empty
-	members, err = db.GetSet("unknown_set")
-	assert.NoError(t, err)
-	assert.Empty(t, members)
+	members, err = suite.Database.GetSet(ctx, "unknown_set")
+	suite.NoError(err)
+	suite.Empty(members)
 	// test rem empty
-	err = db.RemSet("set")
-	assert.NoError(t, err)
+	err = suite.Database.RemSet(ctx, "set")
+	suite.NoError(err)
 }
 
-func testSort(t *testing.T, db Database) {
-	// Put scores
-	scores := []Scored{
-		{"0", 0},
-		{"1", 1.1},
-		{"2", 1.2},
-		{"3", 1.3},
-		{"4", 1.4},
-	}
-	err := db.SetSorted("sort", scores[:3])
-	assert.NoError(t, err)
-	err = db.AddSorted(SortedSet{"sort", scores[3:]})
-	assert.NoError(t, err)
-	// Get scores
-	totalItems, err := db.GetSorted("sort", 0, -1)
-	assert.NoError(t, err)
-	assert.Equal(t, []Scored{
-		{"4", 1.4},
-		{"3", 1.3},
-		{"2", 1.2},
-		{"1", 1.1},
-		{"0", 0},
-	}, totalItems)
-	halfItems, err := db.GetSorted("sort", 0, 2)
-	assert.NoError(t, err)
-	assert.Equal(t, []Scored{
-		{"4", 1.4},
-		{"3", 1.3},
-		{"2", 1.2},
-	}, halfItems)
-	halfItems, err = db.GetSorted("sort", 1, 2)
-	assert.NoError(t, err)
-	assert.Equal(t, []Scored{
-		{"3", 1.3},
-		{"2", 1.2},
-	}, halfItems)
-	// get scores by score
-	partItems, err := db.GetSortedByScore("sort", 1.1, 1.3)
-	assert.NoError(t, err)
-	assert.Equal(t, []Scored{
-		{"1", 1.1},
-		{"2", 1.2},
-		{"3", 1.3},
-	}, partItems)
-	// remove scores by score
-	err = db.AddSorted(SortedSet{"sort", []Scored{
-		{"5", -5},
-		{"6", -6},
-	}})
-	assert.NoError(t, err)
-	err = db.RemSortedByScore("sort", math.Inf(-1), -1)
-	assert.NoError(t, err)
-	partItems, err = db.GetSortedByScore("sort", math.Inf(-1), -1)
-	assert.NoError(t, err)
-	assert.Empty(t, partItems)
-	// Remove score
-	err = db.RemSorted(Member("sort", "0"))
-	assert.NoError(t, err)
-	totalItems, err = db.GetSorted("sort", 0, -1)
-	assert.NoError(t, err)
-	assert.Equal(t, []Scored{
-		{"4", 1.4},
-		{"3", 1.3},
-		{"2", 1.2},
-		{"1", 1.1},
-	}, totalItems)
-
-	// test set empty
-	err = db.SetSorted("sort", []Scored{})
-	assert.NoError(t, err)
-	// test set duplicate
-	err = db.SetSorted("sort1000", []Scored{
-		{"100", 1},
-		{"100", 2},
-	})
-	assert.NoError(t, err)
-	// test add empty
-	err = db.AddSorted()
-	assert.NoError(t, err)
-	err = db.AddSorted(SortedSet{})
-	assert.NoError(t, err)
-	// test add duplicate
-	err = db.AddSorted(SortedSet{"sort1000", []Scored{{"100", 1}, {"100", 2}}})
-	assert.NoError(t, err)
-	// test get empty
-	scores, err = db.GetSorted("sort", 0, -1)
-	assert.NoError(t, err)
-	assert.Empty(t, scores)
-	scores, err = db.GetSorted("sort", 10, 5)
-	assert.NoError(t, err)
-	assert.Empty(t, scores)
-}
-
-func testScan(t *testing.T, db Database) {
-	err := db.Set(String("1", "1"))
-	assert.NoError(t, err)
-	err = db.SetSet("2", "21", "22", "23")
-	assert.NoError(t, err)
-	err = db.SetSorted("3", []Scored{{"1", 1}, {"2", 2}, {"3", 3}})
-	assert.NoError(t, err)
+func (suite *baseTestSuite) TestScan() {
+	ctx := context.Background()
+	err := suite.Database.Set(ctx, String("1", "1"))
+	suite.NoError(err)
+	err = suite.Database.SetSet(ctx, "2", "21", "22", "23")
+	suite.NoError(err)
 
 	var keys []string
-	err = db.Scan(func(s string) error {
+	err = suite.Database.Scan(func(s string) error {
 		keys = append(keys, s)
 		return nil
 	})
-	assert.NoError(t, err)
-	assert.ElementsMatch(t, []string{"1", "2", "3"}, keys)
+	suite.NoError(err)
+	suite.ElementsMatch([]string{"1", "2"}, keys)
 }
 
-func TestScored(t *testing.T) {
-	itemIds := []string{"2", "4", "6"}
-	scores := []float64{2, 4, 6}
-	scored := []Scored{{Id: "2", Score: 2}, {Id: "4", Score: 4}, {Id: "6", Score: 6}}
-	assert.Equal(t, scored, CreateScoredItems(itemIds, scores))
-	assert.Equal(t, itemIds, RemoveScores(scored))
-	assert.Equal(t, scores, GetScores(scored))
-	SortScores(scored)
-	assert.Equal(t, []Scored{{Id: "6", Score: 6}, {Id: "4", Score: 4}, {Id: "2", Score: 2}}, scored)
+func (suite *baseTestSuite) TestPurge() {
+	ctx := context.Background()
+	// insert data
+	err := suite.Database.Set(ctx, String("key", "value"))
+	suite.NoError(err)
+	ret := suite.Database.Get(ctx, "key")
+	suite.NoError(ret.err)
+	suite.Equal("value", ret.value)
+
+	err = suite.Database.AddSet(ctx, "set", "a", "b", "c")
+	suite.NoError(err)
+	s, err := suite.Database.GetSet(ctx, "set")
+	suite.NoError(err)
+	suite.ElementsMatch([]string{"a", "b", "c"}, s)
+
+	// purge data
+	err = suite.Database.Purge()
+	suite.NoError(err)
+	ret = suite.Database.Get(ctx, "key")
+	suite.ErrorIs(ret.err, errors.NotFound)
+	s, err = suite.Database.GetSet(ctx, "set")
+	suite.NoError(err)
+	suite.Empty(s)
+
+	// purge empty dataset
+	err = suite.Database.Purge()
+	suite.NoError(err)
+}
+
+func (suite *baseTestSuite) TestPushPop() {
+	ctx := context.Background()
+	err := suite.Push(ctx, "a", "1")
+	suite.NoError(err)
+	err = suite.Push(ctx, "a", "2")
+	suite.NoError(err)
+	count, err := suite.Remain(ctx, "a")
+	suite.NoError(err)
+	suite.Equal(int64(2), count)
+
+	err = suite.Push(ctx, "b", "1")
+	suite.NoError(err)
+	err = suite.Push(ctx, "b", "2")
+	suite.NoError(err)
+	err = suite.Push(ctx, "b", "1")
+	suite.NoError(err)
+	count, err = suite.Remain(ctx, "b")
+	suite.NoError(err)
+	suite.Equal(int64(2), count)
+
+	value, err := suite.Pop(ctx, "a")
+	suite.NoError(err)
+	suite.Equal("1", value)
+	value, err = suite.Pop(ctx, "a")
+	suite.NoError(err)
+	suite.Equal("2", value)
+	_, err = suite.Pop(ctx, "a")
+	suite.ErrorIs(err, io.EOF)
+
+	value, err = suite.Pop(ctx, "b")
+	suite.NoError(err)
+	suite.Equal("2", value)
+	value, err = suite.Pop(ctx, "b")
+	suite.NoError(err)
+	suite.Equal("1", value)
+	_, err = suite.Pop(ctx, "b")
+	suite.ErrorIs(err, io.EOF)
+}
+
+func (suite *baseTestSuite) TestDocument() {
+	ts := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	err := suite.AddScores(ctx, "a", "", []Score{{
+		Id:         "0",
+		Score:      math.MaxFloat64,
+		IsHidden:   true,
+		Categories: []string{"a", "b"},
+		Timestamp:  ts,
+	}})
+	suite.NoError(err)
+	err = suite.AddScores(ctx, "a", "", []Score{{
+		Id:         "1",
+		Score:      100,
+		Categories: []string{"a", "b"},
+		Timestamp:  ts,
+	}})
+	suite.NoError(err)
+	err = suite.AddScores(ctx, "a", "", []Score{
+		{
+			Id:         "1",
+			Score:      1,
+			Categories: []string{"a", "b"},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "2",
+			Score:      2,
+			Categories: []string{"b", "c"},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "3",
+			Score:      3,
+			Categories: []string{"b"},
+			Timestamp:  time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			Id:         "4",
+			Score:      4,
+			Categories: []string{""},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "5",
+			Score:      5,
+			Categories: []string{"b"},
+			Timestamp:  ts,
+		},
+	})
+	suite.NoError(err)
+	err = suite.AddScores(ctx, "b", "", []Score{{
+		Id:         "6",
+		Score:      6,
+		Categories: []string{"b"},
+		Timestamp:  ts,
+	}})
+	suite.NoError(err)
+
+	// search documents
+	documents, err := suite.SearchScores(ctx, "a", "", []string{"b"}, 1, 3)
+	suite.NoError(err)
+	suite.Equal([]Score{
+		{Id: "3", Score: 3, Categories: []string{"b"}, Timestamp: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{Id: "2", Score: 2, Categories: []string{"b", "c"}, Timestamp: ts},
+	}, documents)
+	documents, err = suite.SearchScores(ctx, "a", "", []string{"b"}, 0, -1)
+	suite.NoError(err)
+	suite.Equal([]Score{
+		{Id: "5", Score: 5, Categories: []string{"b"}, Timestamp: ts},
+		{Id: "3", Score: 3, Categories: []string{"b"}, Timestamp: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{Id: "2", Score: 2, Categories: []string{"b", "c"}, Timestamp: ts},
+		{Id: "1", Score: 1, Categories: []string{"a", "b"}, Timestamp: ts},
+	}, documents)
+
+	// search documents with nil category
+	documents, err = suite.SearchScores(ctx, "a", "", nil, 0, -1)
+	suite.NoError(err)
+	suite.Equal([]Score{
+		{Id: "5", Score: 5, Categories: []string{"b"}, Timestamp: ts},
+		{Id: "4", Score: 4, Categories: []string{""}, Timestamp: ts},
+		{Id: "3", Score: 3, Categories: []string{"b"}, Timestamp: time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{Id: "2", Score: 2, Categories: []string{"b", "c"}, Timestamp: ts},
+		{Id: "1", Score: 1, Categories: []string{"a", "b"}, Timestamp: ts},
+	}, documents)
+
+	// search documents with empty category
+	documents, err = suite.SearchScores(ctx, "a", "", []string{""}, 0, -1)
+	suite.NoError(err)
+	suite.Equal([]Score{{Id: "4", Score: 4, Categories: []string{""}, Timestamp: ts}}, documents)
+
+	// delete nothing
+	err = suite.DeleteScores(ctx, []string{"a"}, ScoreCondition{})
+	suite.ErrorIs(err, errors.NotValid)
+	// delete by value
+	err = suite.DeleteScores(ctx, []string{"a"}, ScoreCondition{Id: proto.String("5")})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("3", documents[0].Id)
+	// delete by timestamp
+	err = suite.DeleteScores(ctx, []string{"a"}, ScoreCondition{Before: lo.ToPtr(time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC))})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+
+	// update categories
+	err = suite.UpdateScores(ctx, []string{"a"}, nil, "2", ScorePatch{Categories: []string{"c", "s"}})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "", []string{"s"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+	err = suite.UpdateScores(ctx, []string{"a"}, nil, "2", ScorePatch{Categories: []string{"c"}})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "", []string{"s"}, 0, 1)
+	suite.NoError(err)
+	suite.Empty(documents)
+
+	// update is hidden
+	err = suite.UpdateScores(ctx, []string{"a"}, nil, "0", ScorePatch{IsHidden: proto.Bool(false)})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("0", documents[0].Id)
+}
+
+func (suite *baseTestSuite) TestSubsetDocument() {
+	ts := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	err := suite.AddScores(ctx, "a", "a", []Score{
+		{
+			Id:         "1",
+			Score:      1,
+			Categories: []string{"a", "b"},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "2",
+			Score:      2,
+			Categories: []string{"b", "c"},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "3",
+			Score:      3,
+			Categories: []string{"b"},
+			Timestamp:  ts,
+		},
+	})
+	suite.NoError(err)
+	err = suite.AddScores(ctx, "b", "", []Score{
+		{
+			Id:         "4",
+			Score:      4,
+			Categories: []string{},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "3",
+			Score:      3,
+			Categories: []string{"b"},
+			Timestamp:  ts,
+		},
+		{
+			Id:         "2",
+			Score:      2,
+			Categories: []string{"b"},
+			Timestamp:  ts,
+		},
+	})
+	suite.NoError(err)
+
+	// search documents
+	documents, err := suite.SearchScores(ctx, "a", "a", []string{"b"}, 0, -1)
+	suite.NoError(err)
+	suite.Equal([]Score{
+		{Id: "3", Score: 3, Categories: []string{"b"}, Timestamp: ts},
+		{Id: "2", Score: 2, Categories: []string{"b", "c"}, Timestamp: ts},
+		{Id: "1", Score: 1, Categories: []string{"a", "b"}, Timestamp: ts},
+	}, documents)
+
+	// update categories
+	err = suite.UpdateScores(ctx, []string{"a", "b"}, nil, "2", ScorePatch{Categories: []string{"b", "s"}})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "a", []string{"s"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+	documents, err = suite.SearchScores(ctx, "b", "", []string{"s"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+
+	// update categories in subset
+	err = suite.UpdateScores(ctx, []string{"a", "b"}, proto.String("a"), "2", ScorePatch{Categories: []string{"b", "x"}})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "a", []string{"x"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+	documents, err = suite.SearchScores(ctx, "b", "", []string{"x"}, 0, 1)
+	suite.NoError(err)
+	suite.Empty(documents)
+
+	// delete by value
+	err = suite.DeleteScores(ctx, []string{"a", "b"}, ScoreCondition{Id: proto.String("3")})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "a", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+	documents, err = suite.SearchScores(ctx, "b", "", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+
+	// delete in subset
+	err = suite.DeleteScores(ctx, []string{"a", "b"}, ScoreCondition{
+		Subset: proto.String("a"),
+		Id:     proto.String("2"),
+	})
+	suite.NoError(err)
+	documents, err = suite.SearchScores(ctx, "a", "a", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("1", documents[0].Id)
+	documents, err = suite.SearchScores(ctx, "b", "", []string{"b"}, 0, 1)
+	suite.NoError(err)
+	suite.Len(documents, 1)
+	suite.Equal("2", documents[0].Id)
+}
+
+func (suite *baseTestSuite) TestTimeSeries() {
+	ts := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
+	ctx := context.Background()
+	err := suite.AddTimeSeriesPoints(ctx, []TimeSeriesPoint{
+		{Name: "a", Value: 1, Timestamp: ts.Add(1 * time.Second)},
+		{Name: "a", Value: 2, Timestamp: ts.Add(2 * time.Second)},
+		{Name: "a", Value: 3, Timestamp: ts.Add(3 * time.Second)},
+		{Name: "a", Value: 4, Timestamp: ts.Add(4 * time.Second)},
+		{Name: "a", Value: 5, Timestamp: ts.Add(5 * time.Second)}})
+	suite.NoError(err)
+
+	points, err := suite.GetTimeSeriesPoints(ctx, "a", ts.Add(2*time.Second), ts.Add(5*time.Second))
+	suite.NoError(err)
+	suite.Equal([]TimeSeriesPoint{
+		{Name: "a", Value: 2, Timestamp: ts.Add(2 * time.Second)},
+		{Name: "a", Value: 3, Timestamp: ts.Add(3 * time.Second)},
+		{Name: "a", Value: 4, Timestamp: ts.Add(4 * time.Second)},
+	}, points)
 }
 
 func TestKey(t *testing.T) {
@@ -228,4 +487,95 @@ func TestKey(t *testing.T) {
 	assert.Equal(t, "a", Key("a"))
 	assert.Equal(t, "a", Key("a", ""))
 	assert.Equal(t, "a/b", Key("a", "b"))
+}
+
+var (
+	benchmarkDataSize = 100000
+	primeTable        []int
+)
+
+func init() {
+	benchmarkDataSizeStr := os.Getenv("BENCHMARK_DATA_SIZE")
+	if benchmarkDataSizeStr != "" {
+		benchmarkDataSize, _ = strconv.Atoi(benchmarkDataSizeStr)
+	}
+	primeTable = primes.Sieve(benchmarkDataSize)
+}
+
+func primeFactor(n int) []int {
+	var factors []int
+	for _, p := range primeTable {
+		if n%p == 0 {
+			factors = append(factors, p)
+		}
+	}
+	return factors
+}
+
+func benchmark(b *testing.B, database Database) {
+	b.Run("AddScores", func(b *testing.B) {
+		benchmarkAddDocuments(b, database)
+	})
+	b.Run("SearchScores", func(b *testing.B) {
+		benchmarkSearchDocuments(b, database)
+	})
+	b.Run("UpdateScores", func(b *testing.B) {
+		benchmarkUpdateDocuments(b, database)
+	})
+}
+
+func benchmarkAddDocuments(b *testing.B, database Database) {
+	ctx := context.Background()
+	var documents []Score
+	for i := 1; i <= b.N; i++ {
+		documents = append(documents, Score{
+			Id:         strconv.Itoa(i),
+			Score:      float64(-i),
+			Categories: lo.Map(primeFactor(i), func(n, _ int) string { return strconv.Itoa(n) }),
+			Timestamp:  time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+	}
+	b.ResetTimer()
+	err := database.AddScores(ctx, "a", "", documents)
+	assert.NoError(b, err)
+}
+
+func benchmarkSearchDocuments(b *testing.B, database Database) {
+	// insert data
+	ctx := context.Background()
+	var documents []Score
+	for i := 1; i <= benchmarkDataSize; i++ {
+		documents = append(documents, Score{
+			Id:         strconv.Itoa(i),
+			Score:      float64(-i),
+			Categories: lo.Map(primeFactor(i), func(n, _ int) string { return strconv.Itoa(n) }),
+			Timestamp:  time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+	}
+	err := database.AddScores(ctx, "a", "", documents)
+	assert.NoError(b, err)
+	// search data
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// select a random prime
+		p := primeTable[rand.Intn(len(primeTable))]
+		// search documents
+		r, err := database.SearchScores(ctx, "a", "", []string{strconv.Itoa(p)}, 0, 10)
+		assert.NoError(b, err)
+		assert.NotEmpty(b, r)
+	}
+}
+
+func benchmarkUpdateDocuments(b *testing.B, database Database) {
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 1; i <= b.N; i++ {
+		// select a random number
+		n := rand.Intn(benchmarkDataSize) + 1
+		// update documents
+		err := database.UpdateScores(ctx, []string{"a"}, nil, strconv.Itoa(n), ScorePatch{
+			Score: proto.Float64(float64(n)),
+		})
+		assert.NoError(b, err)
+	}
 }

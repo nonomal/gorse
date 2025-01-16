@@ -15,9 +15,10 @@
 package base
 
 import (
-	"github.com/scylladb/go-set/i32set"
-	"github.com/scylladb/go-set/iset"
 	"math/rand"
+	"sync"
+
+	mapset "github.com/deckarep/golang-set/v2"
 )
 
 // RandomGenerator is the random generator for gorse.
@@ -58,6 +59,14 @@ func (rng RandomGenerator) NormalMatrix(row, col int, mean, stdDev float32) [][]
 	return ret
 }
 
+func (rng RandomGenerator) NormalVector(size int, mean, stdDev float32) []float32 {
+	ret := make([]float32, size)
+	for i := 0; i < len(ret); i++ {
+		ret[i] = float32(rng.NormFloat64())*stdDev + mean
+	}
+	return ret
+}
+
 // UniformMatrix makes a matrix filled with uniform random floats.
 func (rng RandomGenerator) UniformMatrix(row, col int, low, high float32) [][]float32 {
 	ret := make([][]float32, row)
@@ -76,23 +85,17 @@ func (rng RandomGenerator) NormalVector64(size int, mean, stdDev float64) []floa
 	return ret
 }
 
-// NormalMatrix64 makes a matrix filled with normal random floats.
-func (rng RandomGenerator) NormalMatrix64(row, col int, mean, stdDev float64) [][]float64 {
-	ret := make([][]float64, row)
-	for i := range ret {
-		ret[i] = rng.NormalVector64(col, mean, stdDev)
-	}
-	return ret
-}
-
 // Sample n values between low and high, but not in exclude.
-func (rng RandomGenerator) Sample(low, high, n int, exclude ...*iset.Set) []int {
+func (rng RandomGenerator) Sample(low, high, n int, exclude ...mapset.Set[int]) []int {
 	intervalLength := high - low
-	excludeSet := iset.Union(exclude...)
+	excludeSet := mapset.NewSet[int]()
+	for _, set := range exclude {
+		excludeSet = excludeSet.Union(set)
+	}
 	sampled := make([]int, 0, n)
-	if n >= intervalLength-excludeSet.Size() {
+	if n >= intervalLength-excludeSet.Cardinality() {
 		for i := low; i < high; i++ {
-			if !excludeSet.Has(i) {
+			if !excludeSet.Contains(i) {
 				sampled = append(sampled, i)
 				excludeSet.Add(i)
 			}
@@ -100,7 +103,7 @@ func (rng RandomGenerator) Sample(low, high, n int, exclude ...*iset.Set) []int 
 	} else {
 		for len(sampled) < n {
 			v := rng.Intn(intervalLength) + low
-			if !excludeSet.Has(v) {
+			if !excludeSet.Contains(v) {
 				sampled = append(sampled, v)
 				excludeSet.Add(v)
 			}
@@ -110,13 +113,16 @@ func (rng RandomGenerator) Sample(low, high, n int, exclude ...*iset.Set) []int 
 }
 
 // SampleInt32 n 32bit values between low and high, but not in exclude.
-func (rng RandomGenerator) SampleInt32(low, high int32, n int, exclude ...*i32set.Set) []int32 {
+func (rng RandomGenerator) SampleInt32(low, high int32, n int, exclude ...mapset.Set[int32]) []int32 {
 	intervalLength := high - low
-	excludeSet := i32set.Union(exclude...)
+	excludeSet := mapset.NewSet[int32]()
+	for _, set := range exclude {
+		excludeSet = excludeSet.Union(set)
+	}
 	sampled := make([]int32, 0, n)
-	if n >= int(intervalLength)-excludeSet.Size() {
+	if n >= int(intervalLength)-excludeSet.Cardinality() {
 		for i := low; i < high; i++ {
-			if !excludeSet.Has(i) {
+			if !excludeSet.Contains(i) {
 				sampled = append(sampled, i)
 				excludeSet.Add(i)
 			}
@@ -124,11 +130,36 @@ func (rng RandomGenerator) SampleInt32(low, high int32, n int, exclude ...*i32se
 	} else {
 		for len(sampled) < n {
 			v := rng.Int31n(intervalLength) + low
-			if !excludeSet.Has(v) {
+			if !excludeSet.Contains(v) {
 				sampled = append(sampled, v)
 				excludeSet.Add(v)
 			}
 		}
 	}
 	return sampled
+}
+
+// lockedSource allows a random number generator to be used by multiple goroutines concurrently.
+// The code is very similar to math/rand.lockedSource, which is unfortunately not exposed.
+type lockedSource struct {
+	mut sync.Mutex
+	src rand.Source
+}
+
+// NewRand returns a rand.Rand that is threadsafe.
+func NewRand(seed int64) *rand.Rand {
+	return rand.New(&lockedSource{src: rand.NewSource(seed)})
+}
+
+func (r *lockedSource) Int63() (n int64) {
+	r.mut.Lock()
+	n = r.src.Int63()
+	r.mut.Unlock()
+	return
+}
+
+func (r *lockedSource) Seed(seed int64) {
+	r.mut.Lock()
+	r.src.Seed(seed)
+	r.mut.Unlock()
 }

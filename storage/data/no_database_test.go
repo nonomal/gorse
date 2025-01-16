@@ -15,11 +15,16 @@
 package data
 
 import (
-	"github.com/stretchr/testify/assert"
+	"context"
 	"testing"
+	"time"
+
+	"github.com/samber/lo"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestNoDatabase(t *testing.T) {
+	ctx := context.Background()
 	var database NoDatabase
 
 	err := database.Close()
@@ -28,49 +33,60 @@ func TestNoDatabase(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNoDatabase)
 	err = database.Init()
 	assert.ErrorIs(t, err, ErrNoDatabase)
+	err = database.Ping()
+	assert.ErrorIs(t, err, ErrNoDatabase)
+	err = database.Purge()
+	assert.ErrorIs(t, err, ErrNoDatabase)
 
-	err = database.BatchInsertItems(nil)
+	err = database.BatchInsertItems(ctx, nil)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.BatchGetItems(nil)
+	_, err = database.BatchGetItems(ctx, nil)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	err = database.ModifyItem("", ItemPatch{})
+	err = database.ModifyItem(ctx, "", ItemPatch{})
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.GetItem("")
+	_, err = database.GetItem(ctx, "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, _, err = database.GetItems("", 0, nil)
+	_, _, err = database.GetItems(ctx, "", 0, nil)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	err = database.DeleteItem("")
+	err = database.DeleteItem(ctx, "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, c := database.GetItemStream(0, nil)
+	_, c := database.GetItemStream(ctx, 0, nil)
 	assert.ErrorIs(t, <-c, ErrNoDatabase)
 
-	err = database.BatchInsertUsers(nil)
+	err = database.BatchInsertUsers(ctx, nil)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.GetUser("")
+	_, err = database.GetUser(ctx, "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	err = database.ModifyUser("", UserPatch{})
+	err = database.ModifyUser(ctx, "", UserPatch{})
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, _, err = database.GetUsers("", 0)
+	_, _, err = database.GetUsers(ctx, "", 0)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	err = database.DeleteUser("")
+	err = database.DeleteUser(ctx, "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, c = database.GetUserStream(0)
+	_, c = database.GetUserStream(ctx, 0)
 	assert.ErrorIs(t, <-c, ErrNoDatabase)
 
-	err = database.BatchInsertFeedback(nil, false, false, false)
+	err = database.BatchInsertFeedback(ctx, nil, false, false, false)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	err = database.BatchInsertFeedback(nil, false, false, false)
+	err = database.BatchInsertFeedback(ctx, nil, false, false, false)
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.GetUserFeedback("", false)
+	_, err = database.GetUserFeedback(ctx, "", lo.ToPtr(time.Now()))
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.GetItemFeedback("")
+	_, err = database.GetItemFeedback(ctx, "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, _, err = database.GetFeedback("", 0, nil)
+	_, _, err = database.GetFeedback(ctx, "", 0, nil, lo.ToPtr(time.Now()))
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.GetUserItemFeedback("", "")
+	_, err = database.GetUserItemFeedback(ctx, "", "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, err = database.DeleteUserItemFeedback("", "")
+	_, err = database.DeleteUserItemFeedback(ctx, "", "")
 	assert.ErrorIs(t, err, ErrNoDatabase)
-	_, c = database.GetFeedbackStream(0, nil)
+	_, c = database.GetFeedbackStream(ctx, 0)
 	assert.ErrorIs(t, <-c, ErrNoDatabase)
+
+	_, err = database.CountUsers(ctx)
+	assert.ErrorIs(t, err, ErrNoDatabase)
+	_, err = database.CountItems(ctx)
+	assert.ErrorIs(t, err, ErrNoDatabase)
+	_, err = database.CountFeedback(ctx)
+	assert.ErrorIs(t, err, ErrNoDatabase)
 }

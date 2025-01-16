@@ -15,6 +15,7 @@
 package data
 
 import (
+	"context"
 	"time"
 )
 
@@ -31,38 +32,46 @@ func (NoDatabase) Init() error {
 	return ErrNoDatabase
 }
 
+func (NoDatabase) Ping() error {
+	return ErrNoDatabase
+}
+
 // Close method of NoDatabase returns ErrNoDatabase.
 func (NoDatabase) Close() error {
 	return ErrNoDatabase
 }
 
+func (NoDatabase) Purge() error {
+	return ErrNoDatabase
+}
+
 // BatchInsertItems method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) BatchInsertItems(_ []Item) error {
+func (NoDatabase) BatchInsertItems(_ context.Context, _ []Item) error {
 	return ErrNoDatabase
 }
 
 // BatchGetItems method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) BatchGetItems(_ []string) ([]Item, error) {
+func (NoDatabase) BatchGetItems(_ context.Context, _ []string) ([]Item, error) {
 	return nil, ErrNoDatabase
 }
 
 // DeleteItem method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) DeleteItem(_ string) error {
+func (NoDatabase) DeleteItem(_ context.Context, _ string) error {
 	return ErrNoDatabase
 }
 
 // GetItem method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetItem(_ string) (Item, error) {
+func (NoDatabase) GetItem(_ context.Context, _ string) (Item, error) {
 	return Item{}, ErrNoDatabase
 }
 
 // GetItems method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetItems(_ string, _ int, _ *time.Time) (string, []Item, error) {
+func (NoDatabase) GetItems(_ context.Context, _ string, _ int, _ *time.Time) (string, []Item, error) {
 	return "", nil, ErrNoDatabase
 }
 
 // GetItemStream method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetItemStream(_ int, _ *time.Time) (chan []Item, chan error) {
+func (NoDatabase) GetItemStream(_ context.Context, _ int, _ *time.Time) (chan []Item, chan error) {
 	itemChan := make(chan []Item, bufSize)
 	errChan := make(chan error, 1)
 	go func() {
@@ -74,32 +83,32 @@ func (NoDatabase) GetItemStream(_ int, _ *time.Time) (chan []Item, chan error) {
 }
 
 // GetItemFeedback method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetItemFeedback(_ string, _ ...string) ([]Feedback, error) {
+func (NoDatabase) GetItemFeedback(_ context.Context, _ string, _ ...string) ([]Feedback, error) {
 	return nil, ErrNoDatabase
 }
 
 // BatchInsertUsers method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) BatchInsertUsers(_ []User) error {
+func (NoDatabase) BatchInsertUsers(_ context.Context, _ []User) error {
 	return ErrNoDatabase
 }
 
 // DeleteUser method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) DeleteUser(_ string) error {
+func (NoDatabase) DeleteUser(_ context.Context, _ string) error {
 	return ErrNoDatabase
 }
 
 // GetUser method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetUser(_ string) (User, error) {
+func (NoDatabase) GetUser(_ context.Context, _ string) (User, error) {
 	return User{}, ErrNoDatabase
 }
 
 // GetUsers method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetUsers(_ string, _ int) (string, []User, error) {
+func (NoDatabase) GetUsers(_ context.Context, _ string, _ int) (string, []User, error) {
 	return "", nil, ErrNoDatabase
 }
 
 // GetUserStream method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetUserStream(_ int) (chan []User, chan error) {
+func (NoDatabase) GetUserStream(_ context.Context, _ int) (chan []User, chan error) {
 	userChan := make(chan []User, bufSize)
 	errChan := make(chan error, 1)
 	go func() {
@@ -111,32 +120,32 @@ func (NoDatabase) GetUserStream(_ int) (chan []User, chan error) {
 }
 
 // GetUserFeedback method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetUserFeedback(_ string, _ bool, _ ...string) ([]Feedback, error) {
+func (NoDatabase) GetUserFeedback(_ context.Context, _ string, _ *time.Time, _ ...string) ([]Feedback, error) {
 	return nil, ErrNoDatabase
 }
 
 // GetUserItemFeedback method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetUserItemFeedback(_, _ string, _ ...string) ([]Feedback, error) {
+func (NoDatabase) GetUserItemFeedback(_ context.Context, _, _ string, _ ...string) ([]Feedback, error) {
 	return nil, ErrNoDatabase
 }
 
 // DeleteUserItemFeedback method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) DeleteUserItemFeedback(_, _ string, _ ...string) (int, error) {
+func (NoDatabase) DeleteUserItemFeedback(_ context.Context, _, _ string, _ ...string) (int, error) {
 	return 0, ErrNoDatabase
 }
 
 // BatchInsertFeedback method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) BatchInsertFeedback(_ []Feedback, _, _, _ bool) error {
+func (NoDatabase) BatchInsertFeedback(_ context.Context, _ []Feedback, _, _, _ bool) error {
 	return ErrNoDatabase
 }
 
 // GetFeedback method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetFeedback(_ string, _ int, _ *time.Time, _ ...string) (string, []Feedback, error) {
+func (NoDatabase) GetFeedback(_ context.Context, _ string, _ int, _, _ *time.Time, _ ...string) (string, []Feedback, error) {
 	return "", nil, ErrNoDatabase
 }
 
 // GetFeedbackStream method of NoDatabase returns ErrNoDatabase.
-func (NoDatabase) GetFeedbackStream(_ int, _ *time.Time, _ ...string) (chan []Feedback, chan error) {
+func (NoDatabase) GetFeedbackStream(_ context.Context, _ int, _ ...ScanOption) (chan []Feedback, chan error) {
 	feedbackChan := make(chan []Feedback, bufSize)
 	errChan := make(chan error, 1)
 	go func() {
@@ -147,10 +156,22 @@ func (NoDatabase) GetFeedbackStream(_ int, _ *time.Time, _ ...string) (chan []Fe
 	return feedbackChan, errChan
 }
 
-func (d NoDatabase) ModifyItem(_ string, _ ItemPatch) error {
+func (d NoDatabase) ModifyItem(_ context.Context, _ string, _ ItemPatch) error {
 	return ErrNoDatabase
 }
 
-func (d NoDatabase) ModifyUser(_ string, _ UserPatch) error {
+func (d NoDatabase) ModifyUser(_ context.Context, _ string, _ UserPatch) error {
 	return ErrNoDatabase
+}
+
+func (d NoDatabase) CountUsers(_ context.Context) (int, error) {
+	return 0, ErrNoDatabase
+}
+
+func (d NoDatabase) CountItems(_ context.Context) (int, error) {
+	return 0, ErrNoDatabase
+}
+
+func (d NoDatabase) CountFeedback(_ context.Context) (int, error) {
+	return 0, ErrNoDatabase
 }

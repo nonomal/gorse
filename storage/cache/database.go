@@ -16,43 +16,36 @@ package cache
 
 import (
 	"context"
-	"database/sql"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/XSAM/otelsql"
 	"github.com/araddon/dateparse"
-	"github.com/dzwvip/oracle"
-	"github.com/go-redis/redis/v8"
 	"github.com/juju/errors"
+	"github.com/redis/go-redis/extra/redisotel/v9"
+	"github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
 	"github.com/zhenghaoz/gorse/base/log"
 	"github.com/zhenghaoz/gorse/storage"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo"
+	semconv "go.opentelemetry.io/otel/semconv/v1.8.0"
+	"go.uber.org/zap"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"moul.io/zapgorm2"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
 )
 
 const (
-	// Measurements are sorted set of measurements.
-	// 	Measurements - measurements/{name}
-	Measurements = "measurements"
-
-	// IgnoreItems is sorted set of ignored items for each user
-	//  Ignored items      - ignore_items/{user_id}
-	IgnoreItems = "ignore_items"
-
-	// HiddenItemsV2 is sorted set of hidden items.
-	//  Global hidden items 	- hidden_items_v2
-	//  Category hidden items   - hidden_items_v2/{category}
-	HiddenItemsV2 = "hidden_items_v2"
-
 	// ItemNeighbors is sorted set of neighbors for each item.
 	//  Global item neighbors      - item_neighbors/{item_id}
 	//  Categorized item neighbors - item_neighbors/{item_id}/{category}
@@ -84,15 +77,9 @@ const (
 	//	Recommendation digest      - offline_recommend_digest/{user_id}
 	OfflineRecommendDigest = "offline_recommend_digest"
 
-	// PopularItems is sorted set of popular items. The format of key:
-	//  Global popular items      - latest_items
-	//  Categorized popular items - latest_items/{category}
-	PopularItems = "popular_items"
-
-	// LatestItems is sorted set of the latest items. The format of key:
-	//  Global latest items      - latest_items
-	//  Categorized the latest items - latest_items/{category}
-	LatestItems = "latest_items"
+	NonPersonalized = "non-personalized"
+	Latest          = "latest"
+	Popular         = "popular"
 
 	// ItemCategories is the set of item categories. The format of key:
 	//	Global item categories - item_categories
@@ -123,69 +110,12 @@ const (
 	MatchingIndexRecall        = "matching_index_recall"
 )
 
+var ItemCache = []string{NonPersonalized, ItemNeighbors, OfflineRecommend}
+
 var (
 	ErrObjectNotExist = errors.NotFoundf("object")
 	ErrNoDatabase     = errors.NotAssignedf("database")
 )
-
-// Scored associate a id with a score.
-type Scored struct {
-	Id    string
-	Score float64
-}
-
-// CreateScoredItems from items and scores.
-func CreateScoredItems[T float64 | float32](itemIds []string, scores []T) []Scored {
-	if len(itemIds) != len(scores) {
-		panic("the length of itemIds and scores should be equal")
-	}
-	items := make([]Scored, len(itemIds))
-	for i := range items {
-		items[i].Id = itemIds[i]
-		items[i].Score = float64(scores[i])
-	}
-	return items
-}
-
-// RemoveScores resolve items for a slice of ScoredItems.
-func RemoveScores(items []Scored) []string {
-	ids := make([]string, len(items))
-	for i := range ids {
-		ids[i] = items[i].Id
-	}
-	return ids
-}
-
-// GetScores resolve scores for a slice of Scored.
-func GetScores(s []Scored) []float64 {
-	scores := make([]float64, len(s))
-	for i := range s {
-		scores[i] = s[i].Score
-	}
-	return scores
-}
-
-// SortScores sorts scores from high score to low score.
-func SortScores(scores []Scored) {
-	sort.Sort(scoresSorter(scores))
-}
-
-type scoresSorter []Scored
-
-// Len is the number of elements in the collection.
-func (s scoresSorter) Len() int {
-	return len(s)
-}
-
-// Less reports whether the element with index i
-func (s scoresSorter) Less(i, j int) bool {
-	return s[i].Score > s[j].Score
-}
-
-// Swap swaps the elements with indexes i and j.
-func (s scoresSorter) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
 
 // Key creates key for cache. Empty field will be ignored.
 func Key(keys ...string) string {
@@ -201,13 +131,6 @@ func Key(keys ...string) string {
 		}
 	}
 	return builder.String()
-}
-
-func BatchKey(prefix string, keys ...string) []string {
-	for i, key := range keys {
-		keys[i] = Key(prefix, key)
-	}
-	return keys
 }
 
 type Value struct {
@@ -247,66 +170,174 @@ func (r *ReturnValue) Time() (time.Time, error) {
 	if r.err != nil {
 		return time.Time{}, r.err
 	}
-	return dateparse.ParseAny(r.value)
+	t, err := dateparse.ParseAny(r.value)
+	if err != nil {
+		return time.Time{}, errors.Trace(err)
+	}
+	return t.In(time.UTC), nil
 }
 
-type SortedSet struct {
-	name   string
-	scores []Scored
+type Score struct {
+	Id         string
+	Score      float64
+	IsHidden   bool      `json:"-"`
+	Categories []string  `json:"-" gorm:"type:text;serializer:json"`
+	Timestamp  time.Time `json:"-"`
 }
 
-func Sorted(name string, scores []Scored) SortedSet {
-	return SortedSet{name: name, scores: scores}
+func SortDocuments(documents []Score) {
+	sort.Slice(documents, func(i, j int) bool {
+		return documents[i].Score > documents[j].Score
+	})
 }
 
-type SetMember struct {
-	name   string
-	member string
+func ConvertDocumentsToValues(documents []Score) []string {
+	values := make([]string, len(documents))
+	for i := range values {
+		values[i] = documents[i].Id
+	}
+	return values
 }
 
-func Member(name, member string) SetMember {
-	return SetMember{name: name, member: member}
+// DocumentAggregator is used to keep the compatibility with the old recommender system and will be removed in the future.
+// In old recommender system, the recommendation is genereated per category.
+// In the new recommender system, the recommendation is generated globally.
+type DocumentAggregator struct {
+	Documents map[string]*Score
+	Timestamp time.Time
+}
+
+func NewDocumentAggregator(timestamp time.Time) *DocumentAggregator {
+	return &DocumentAggregator{
+		Documents: make(map[string]*Score),
+		Timestamp: timestamp,
+	}
+}
+
+func (aggregator *DocumentAggregator) Add(category string, values []string, scores []float64) {
+	for i, value := range values {
+		if _, ok := aggregator.Documents[value]; !ok {
+			aggregator.Documents[value] = &Score{
+				Id:         value,
+				Score:      scores[i],
+				Categories: []string{category},
+				Timestamp:  aggregator.Timestamp,
+			}
+		} else {
+			aggregator.Documents[value].Score = math.Max(aggregator.Documents[value].Score, scores[i])
+			aggregator.Documents[value].Categories = append(aggregator.Documents[value].Categories, category)
+		}
+	}
+}
+
+func (aggregator *DocumentAggregator) ToSlice() []Score {
+	documents := make([]Score, 0, len(aggregator.Documents))
+	for _, document := range aggregator.Documents {
+		sort.Strings(document.Categories)
+		documents = append(documents, *document)
+	}
+	return documents
+}
+
+type ScoreCondition struct {
+	Subset *string
+	Id     *string
+	Before *time.Time
+}
+
+func (condition *ScoreCondition) Check() error {
+	if condition.Id == nil && condition.Before == nil && condition.Subset == nil {
+		return errors.NotValidf("document condition")
+	}
+	return nil
+}
+
+type ScorePatch struct {
+	IsHidden   *bool
+	Categories []string
+	Score      *float64
+}
+
+type TimeSeriesPoint struct {
+	Name      string    `gorm:"primaryKey"`
+	Timestamp time.Time `gorm:"primaryKey"`
+	Value     float64
 }
 
 // Database is the common interface for cache store.
 type Database interface {
 	Close() error
+	Ping() error
 	Init() error
 	Scan(work func(string) error) error
+	Purge() error
 
-	Set(values ...Value) error
-	Get(name string) *ReturnValue
-	Delete(name string) error
+	Set(ctx context.Context, values ...Value) error
+	Get(ctx context.Context, name string) *ReturnValue
+	Delete(ctx context.Context, name string) error
 
-	GetSet(key string) ([]string, error)
-	SetSet(key string, members ...string) error
-	AddSet(key string, members ...string) error
-	RemSet(key string, members ...string) error
+	GetSet(ctx context.Context, key string) ([]string, error)
+	SetSet(ctx context.Context, key string, members ...string) error
+	AddSet(ctx context.Context, key string, members ...string) error
+	RemSet(ctx context.Context, key string, members ...string) error
 
-	AddSorted(sortedSets ...SortedSet) error
-	GetSorted(key string, begin, end int) ([]Scored, error)
-	GetSortedByScore(key string, begin, end float64) ([]Scored, error)
-	RemSortedByScore(key string, begin, end float64) error
-	SetSorted(key string, scores []Scored) error
-	RemSorted(members ...SetMember) error
+	Push(ctx context.Context, name, value string) error
+	Pop(ctx context.Context, name string) (string, error)
+	Remain(ctx context.Context, name string) (int64, error)
+
+	AddScores(ctx context.Context, collection, subset string, documents []Score) error
+	SearchScores(ctx context.Context, collection, subset string, query []string, begin, end int) ([]Score, error)
+	DeleteScores(ctx context.Context, collection []string, condition ScoreCondition) error
+	UpdateScores(ctx context.Context, collections []string, subset *string, id string, patch ScorePatch) error
+
+	AddTimeSeriesPoints(ctx context.Context, points []TimeSeriesPoint) error
+	GetTimeSeriesPoints(ctx context.Context, name string, begin, end time.Time) ([]TimeSeriesPoint, error)
 }
 
 // Open a connection to a database.
-func Open(path, tablePrefix string) (Database, error) {
+func Open(path, tablePrefix string, opts ...storage.Option) (Database, error) {
 	var err error
 	if strings.HasPrefix(path, storage.RedisPrefix) || strings.HasPrefix(path, storage.RedissPrefix) {
 		opt, err := redis.ParseURL(path)
 		if err != nil {
 			return nil, err
 		}
+		opt.Protocol = 2
 		database := new(Redis)
 		database.client = redis.NewClient(opt)
 		database.TablePrefix = storage.TablePrefix(tablePrefix)
+		if err = redisotel.InstrumentTracing(database.client, redisotel.WithAttributes(semconv.DBSystemRedis)); err != nil {
+			log.Logger().Error("failed to add tracing for redis", zap.Error(err))
+			return nil, errors.Trace(err)
+		}
+		return database, nil
+	} else if strings.HasPrefix(path, storage.RedisClusterPrefix) || strings.HasPrefix(path, storage.RedissClusterPrefix) {
+		var newURL string
+		if strings.HasPrefix(path, storage.RedisClusterPrefix) {
+			newURL = strings.Replace(path, storage.RedisClusterPrefix, storage.RedisPrefix, 1)
+		} else if strings.HasPrefix(path, storage.RedissClusterPrefix) {
+			newURL = strings.Replace(path, storage.RedissClusterPrefix, storage.RedissPrefix, 1)
+		}
+		opt, err := redis.ParseClusterURL(newURL)
+		if err != nil {
+			return nil, err
+		}
+		opt.Protocol = 2
+		database := new(Redis)
+		database.client = redis.NewClusterClient(opt)
+		database.TablePrefix = storage.TablePrefix(tablePrefix)
+		if err = redisotel.InstrumentTracing(database.client, redisotel.WithAttributes(semconv.DBSystemRedis)); err != nil {
+			log.Logger().Error("failed to add tracing for redis", zap.Error(err))
+			return nil, errors.Trace(err)
+		}
 		return database, nil
 	} else if strings.HasPrefix(path, storage.MongoPrefix) || strings.HasPrefix(path, storage.MongoSrvPrefix) {
 		// connect to database
 		database := new(MongoDB)
-		if database.client, err = mongo.Connect(context.Background(), options.Client().ApplyURI(path)); err != nil {
+		opts := options.Client()
+		opts.Monitor = otelmongo.NewMonitor()
+		opts.ApplyURI(path)
+		if database.client, err = mongo.Connect(context.Background(), opts); err != nil {
 			return nil, errors.Trace(err)
 		}
 		// parse DSN and extract database name
@@ -321,7 +352,10 @@ func Open(path, tablePrefix string) (Database, error) {
 		database := new(SQLDatabase)
 		database.driver = Postgres
 		database.TablePrefix = storage.TablePrefix(tablePrefix)
-		if database.client, err = sql.Open("postgres", path); err != nil {
+		if database.client, err = otelsql.Open("postgres", path,
+			otelsql.WithAttributes(semconv.DBSystemPostgreSQL),
+			otelsql.WithSpanOptions(otelsql.SpanOptions{DisableErrSkip: true}),
+		); err != nil {
 			return nil, errors.Trace(err)
 		}
 		database.gormDB, err = gorm.Open(postgres.New(postgres.Config{Conn: database.client}), storage.NewGORMConfig(tablePrefix))
@@ -331,6 +365,7 @@ func Open(path, tablePrefix string) (Database, error) {
 		return database, nil
 	} else if strings.HasPrefix(path, storage.MySQLPrefix) {
 		name := path[len(storage.MySQLPrefix):]
+		option := storage.NewOptions(opts...)
 		// probe isolation variable name
 		isolationVarName, err := storage.ProbeMySQLIsolationVariableName(name)
 		if err != nil {
@@ -338,7 +373,8 @@ func Open(path, tablePrefix string) (Database, error) {
 		}
 		// append parameters
 		if name, err = storage.AppendMySQLParams(name, map[string]string{
-			isolationVarName: "'READ-UNCOMMITTED'",
+			isolationVarName: fmt.Sprintf("'%s'", option.IsolationLevel),
+			"parseTime":      "true",
 		}); err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -346,7 +382,10 @@ func Open(path, tablePrefix string) (Database, error) {
 		database := new(SQLDatabase)
 		database.driver = MySQL
 		database.TablePrefix = storage.TablePrefix(tablePrefix)
-		if database.client, err = sql.Open("mysql", name); err != nil {
+		if database.client, err = otelsql.Open("mysql", name,
+			otelsql.WithAttributes(semconv.DBSystemMySQL),
+			otelsql.WithSpanOptions(otelsql.SpanOptions{DisableErrSkip: true}),
+		); err != nil {
 			return nil, errors.Trace(err)
 		}
 		database.gormDB, err = gorm.Open(mysql.New(mysql.Config{Conn: database.client}), storage.NewGORMConfig(tablePrefix))
@@ -355,19 +394,22 @@ func Open(path, tablePrefix string) (Database, error) {
 		}
 		return database, nil
 	} else if strings.HasPrefix(path, storage.SQLitePrefix) {
+		dataSourceName := path[len(storage.SQLitePrefix):]
 		// append parameters
-		if path, err = storage.AppendURLParams(path, []lo.Tuple2[string, string]{
+		if dataSourceName, err = storage.AppendURLParams(dataSourceName, []lo.Tuple2[string, string]{
 			{"_pragma", "busy_timeout(10000)"},
 			{"_pragma", "journal_mode(wal)"},
 		}); err != nil {
 			return nil, errors.Trace(err)
 		}
 		// connect to database
-		name := path[len(storage.SQLitePrefix):]
 		database := new(SQLDatabase)
 		database.driver = SQLite
 		database.TablePrefix = storage.TablePrefix(tablePrefix)
-		if database.client, err = sql.Open("sqlite", name); err != nil {
+		if database.client, err = otelsql.Open("sqlite", dataSourceName,
+			otelsql.WithAttributes(semconv.DBSystemSqlite),
+			otelsql.WithSpanOptions(otelsql.SpanOptions{DisableErrSkip: true}),
+		); err != nil {
 			return nil, errors.Trace(err)
 		}
 		gormConfig := storage.NewGORMConfig(tablePrefix)
@@ -379,18 +421,6 @@ func Open(path, tablePrefix string) (Database, error) {
 			IgnoreRecordNotFoundError: false,
 		}
 		database.gormDB, err = gorm.Open(sqlite.Dialector{Conn: database.client}, gormConfig)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		return database, nil
-	} else if strings.HasPrefix(path, storage.OraclePrefix) {
-		database := new(SQLDatabase)
-		database.driver = Oracle
-		database.TablePrefix = storage.TablePrefix(tablePrefix)
-		if database.client, err = sql.Open("oracle", path); err != nil {
-			return nil, errors.Trace(err)
-		}
-		database.gormDB, err = gorm.Open(oracle.New(oracle.Config{Conn: database.client}), storage.NewGORMConfig(tablePrefix))
 		if err != nil {
 			return nil, errors.Trace(err)
 		}

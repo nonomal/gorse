@@ -24,9 +24,9 @@ These following installations are required:
 - **Docker Compose**: Multiple databases are required for unit tests. It's convenient to manage databases on Docker Compose.
 
 ```bash
-cd misc/database_test
+cd storage
 
-docker-compose up -d
+docker compose up -d
 ```
 
 If you need import sample data, download the SQL file github.sql and import to the MySQL instance.
@@ -42,7 +42,7 @@ mysql -h 127.0.0.1 -u gorse -pgorse_pass gorse < github.sql
 ### Option 1: Run an All-in-one Node
 
 ```bash
-go run cmd/gorse-in-one/main.go --config config/config.toml.template
+go run cmd/gorse-in-one/main.go --config config/config.toml
 ```
 
 ### Option 2: Run Nodes
@@ -50,7 +50,7 @@ go run cmd/gorse-in-one/main.go --config config/config.toml.template
 - Start the master node with the configuration file.
 
 ```bash
-go run cmd/gorse-master/main.go --config config/config.toml.template
+go run cmd/gorse-master/main.go --config config/config.toml
 ```
 
 - Start the worker node.
@@ -73,7 +73,7 @@ Most logics in Gorse are covered by unit tests. Run unit tests by the following 
 go test -v ./...
 ```
 
-The default database URLs are directed to these databases in `misc/database_test/docker-compose.yml`. Test databases could be overrode by setting following environment variables:
+The default database URLs are directed to these databases in `storage/docker-compose.yml`. Test databases could be overrode by setting following environment variables:
 
 | Environment Value | Default Value                                |
 |-------------------|----------------------------------------------|
@@ -81,7 +81,6 @@ The default database URLs are directed to these databases in `misc/database_test
 | `POSTGRES_URI`    | `postgres://gorse:gorse_pass@127.0.0.1/`     |
 | `MONGO_URI`       | `mongodb://root:password@127.0.0.1:27017/`   |
 | `CLICKHOUSE_URI`  | `clickhouse://127.0.0.1:8123/`               |
-| `ORACLE_URI`      | `oracle://system:password@127.0.0.1:1521/XE` |
 | `REDIS_URI`       | `redis://127.0.0.1:6379/`                    |
 
 For example, use TiDB as a test database by:

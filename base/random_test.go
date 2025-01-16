@@ -14,13 +14,12 @@
 package base
 
 import (
+	"testing"
+
 	"github.com/chewxy/math32"
-	"github.com/scylladb/go-set"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/thoas/go-funk"
-	"gonum.org/v1/gonum/stat"
-	"math"
-	"testing"
 )
 
 const randomEpsilon = 0.1
@@ -39,31 +38,24 @@ func TestRandomGenerator_MakeUniformMatrix(t *testing.T) {
 	assert.False(t, funk.MaxFloat32(vec) > 2)
 }
 
-func TestRandomGenerator_MakeNormalMatrix64(t *testing.T) {
-	rng := NewRandomGenerator(0)
-	vec := rng.NormalMatrix64(1, 1000, 1, 2)[0]
-	assert.False(t, math.Abs(stat.Mean(vec, nil)-1) > randomEpsilon)
-	assert.False(t, math.Abs(stat.StdDev(vec, nil)-2) > randomEpsilon)
-}
-
 func TestRandomGenerator_Sample(t *testing.T) {
-	excludeSet := set.NewIntSet(0, 1, 2, 3, 4)
+	excludeSet := mapset.NewSet(0, 1, 2, 3, 4)
 	rng := NewRandomGenerator(0)
 	for i := 1; i <= 10; i++ {
 		sampled := rng.Sample(0, 10, i, excludeSet)
 		for j := range sampled {
-			assert.False(t, excludeSet.Has(sampled[j]))
+			assert.False(t, excludeSet.Contains(sampled[j]))
 		}
 	}
 }
 
 func TestRandomGenerator_SampleInt32(t *testing.T) {
-	excludeSet := set.NewInt32Set(0, 1, 2, 3, 4)
+	excludeSet := mapset.NewSet[int32](0, 1, 2, 3, 4)
 	rng := NewRandomGenerator(0)
 	for i := 1; i <= 10; i++ {
 		sampled := rng.SampleInt32(0, 10, i, excludeSet)
 		for j := range sampled {
-			assert.False(t, excludeSet.Has(sampled[j]))
+			assert.False(t, excludeSet.Contains(sampled[j]))
 		}
 	}
 }
@@ -80,8 +72,10 @@ func stdDev(x []float32) float32 {
 }
 
 // meanVariance computes the sample mean and unbiased variance, where the mean and variance are
-//  \sum_i w_i * x_i / (sum_i w_i)
-//  \sum_i w_i (x_i - mean)^2 / (sum_i w_i - 1)
+//
+//	\sum_i w_i * x_i / (sum_i w_i)
+//	\sum_i w_i (x_i - mean)^2 / (sum_i w_i - 1)
+//
 // respectively.
 // If weights is nil then all of the weights are 1. If weights is not nil, then
 // len(x) must equal len(weights).
